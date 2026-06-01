@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Sequence
 
 import json
@@ -812,6 +813,30 @@ def _use_p58_refine_line_project_scatter_bwd(rows: int) -> bool:
         return False
     min_rows = _env_int("MATRIS_P58_REFINE_LINE_PROJECT_SCATTER_MIN_ROWS", 0)
     max_rows = _env_int("MATRIS_P58_REFINE_LINE_PROJECT_SCATTER_MAX_ROWS", 1000000000)
+    return min_rows <= rows <= max_rows
+
+
+def _use_p110_refine_atom_edge_update(rows: int) -> bool:
+    if os.environ.get("MATRIS_P110_REFINE_ATOM_EDGE_UPDATE", "0") != "1":
+        return False
+    min_rows = _env_int("MATRIS_P110_REFINE_ATOM_EDGE_UPDATE_MIN_ROWS", 0)
+    max_rows = _env_int("MATRIS_P110_REFINE_ATOM_EDGE_UPDATE_MAX_ROWS", 1000000000)
+    return min_rows <= rows <= max_rows
+
+
+def _use_p111_refine_atom_fused_first(rows: int) -> bool:
+    if os.environ.get("MATRIS_P111_REFINE_ATOM_FUSED_FIRST", "0") != "1":
+        return False
+    min_rows = _env_int("MATRIS_P111_REFINE_ATOM_FUSED_FIRST_MIN_ROWS", 0)
+    max_rows = _env_int("MATRIS_P111_REFINE_ATOM_FUSED_FIRST_MAX_ROWS", 1000000000)
+    return min_rows <= rows <= max_rows
+
+
+def _use_p112_refine_atom_fused_first_bwd(rows: int) -> bool:
+    if os.environ.get("MATRIS_P112_REFINE_ATOM_FUSED_FIRST_BWD", "0") != "1":
+        return False
+    min_rows = _env_int("MATRIS_P112_REFINE_ATOM_FUSED_FIRST_BWD_MIN_ROWS", 0)
+    max_rows = _env_int("MATRIS_P112_REFINE_ATOM_FUSED_FIRST_BWD_MAX_ROWS", 2048)
     return min_rows <= rows <= max_rows
 
 
@@ -1960,6 +1985,136 @@ class _RefineLineEdgeFirstProjection(torch.autograd.Function):
                 ctx.atom_rows,
             )
         return grad_node, grad_edge, grad_atom, None, None, None, None, None
+
+
+class _RefineAtomEdgeFirstProjection(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        node_feat: Tensor,
+        edge_feat: Tensor,
+        edge_index: Tensor,
+        source_index: Tensor,
+        target_index: Tensor,
+        weight: Tensor,
+        bias: Tensor | None,
+    ) -> Tensor:
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "directed_edge_gather_cat_forward"):
+            raise RuntimeError("matris_op.directed_edge_gather_cat_forward is unavailable")
+        edge_index = edge_index.contiguous()
+        source_index = source_index.contiguous()
+        target_index = target_index.contiguous()
+        x = matris_op.directed_edge_gather_cat_forward(
+            node_feat.contiguous(),
+            edge_feat.contiguous(),
+            edge_index,
+            source_index,
+            target_index,
+        )
+        projected = F.linear(x, weight, bias)
+        ctx.save_for_backward(weight, edge_index, source_index, target_index)
+        ctx.node_rows = int(node_feat.shape[0])
+        ctx.edge_rows = int(edge_feat.shape[0])
+        return projected
+
+    @staticmethod
+    def backward(ctx, grad_projected: Tensor):
+        weight, edge_index, source_index, target_index = ctx.saved_tensors
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "directed_edge_cat_grad_scatter_backward"):
+            raise RuntimeError("matris_op.directed_edge_cat_grad_scatter_backward is unavailable")
+        grad_cat = grad_projected.contiguous().matmul(weight)
+        grad_node, grad_edge = matris_op.directed_edge_cat_grad_scatter_backward(
+            grad_cat.contiguous(),
+            edge_index,
+            source_index,
+            target_index,
+            ctx.node_rows,
+            ctx.edge_rows,
+        )
+        return grad_node, grad_edge, None, None, None, None, None
+
+
+class _P111RefineAtomFirstSilu(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        node_feat: Tensor,
+        edge_feat: Tensor,
+        edge_index: Tensor,
+        source_index: Tensor,
+        target_index: Tensor,
+        weight: Tensor,
+        bias: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "directed_edge_gather_cat_forward"):
+            raise RuntimeError("matris_op.directed_edge_gather_cat_forward is unavailable")
+        edge_index = edge_index.contiguous()
+        source_index = source_index.contiguous()
+        target_index = target_index.contiguous()
+        x = matris_op.directed_edge_gather_cat_forward(
+            node_feat.contiguous(),
+            edge_feat.contiguous(),
+            edge_index,
+            source_index,
+            target_index,
+        )
+        projected = F.linear(x, weight, bias)
+        core_raw, gate_raw = projected.split([128, 128], dim=-1)
+        core = F.silu(core_raw)
+        gate = F.silu(gate_raw)
+        ctx.save_for_backward(core_raw, gate_raw, weight.contiguous(), edge_index, source_index, target_index)
+        ctx.node_rows = int(node_feat.shape[0])
+        ctx.edge_rows = int(edge_feat.shape[0])
+        return core, gate
+
+    @staticmethod
+    def backward(ctx, grad_core: Tensor | None, grad_gate: Tensor | None):
+        core_raw, gate_raw, weight, edge_index, source_index, target_index = ctx.saved_tensors
+        if grad_core is None:
+            grad_core = core_raw.new_zeros(core_raw.shape)
+        if grad_gate is None:
+            grad_gate = gate_raw.new_zeros(gate_raw.shape)
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "directed_edge_cat_grad_scatter_backward"):
+            raise RuntimeError("matris_op.directed_edge_cat_grad_scatter_backward is unavailable")
+        rows = int(core_raw.shape[0])
+        if (
+            _use_p112_refine_atom_fused_first_bwd(rows)
+            and hasattr(matris_op, "directed_edge_silu_project_grad_scatter_backward_tile32")
+        ):
+            grad_node, grad_edge = matris_op.directed_edge_silu_project_grad_scatter_backward_tile32(
+                grad_core.contiguous(),
+                grad_gate.contiguous(),
+                core_raw,
+                gate_raw,
+                weight,
+                edge_index,
+                source_index,
+                target_index,
+                ctx.node_rows,
+                ctx.edge_rows,
+            )
+            return grad_node, grad_edge, None, None, None, None, None
+        grad_projected = torch.cat(
+            [
+                grad_core.float() * torch.sigmoid(core_raw) * (1.0 + core_raw * (1.0 - torch.sigmoid(core_raw))),
+                grad_gate.float() * torch.sigmoid(gate_raw) * (1.0 + gate_raw * (1.0 - torch.sigmoid(gate_raw))),
+            ],
+            dim=-1,
+        )
+        grad_cat = grad_projected.contiguous().matmul(weight)
+        grad_node, grad_edge = matris_op.directed_edge_cat_grad_scatter_backward(
+            grad_cat.contiguous(),
+            edge_index,
+            source_index,
+            target_index,
+            ctx.node_rows,
+            ctx.edge_rows,
+        )
+        return grad_node, grad_edge, None, None, None, None, None
 
 
 class _P60RefineLineFirstSilu(torch.autograd.Function):
@@ -4473,6 +4628,20 @@ def _use_cuda_input_grad_only_gated_tail_bwd() -> bool:
     return os.environ.get("MATRIS_USE_CUDA_INPUT_GRAD_ONLY_GATED_TAIL_BWD", "0") == "1"
 
 
+def _use_p113_gated_tail_second_silu_macro() -> bool:
+    return os.environ.get("MATRIS_P113_GATED_TAIL_SECOND_SILU_MACRO", "0") == "1"
+
+
+def _use_p116_gated_tail_second_residual_macro() -> bool:
+    return os.environ.get("MATRIS_P116_GATED_TAIL_SECOND_RESIDUAL_MACRO", "0") == "1"
+
+
+def _p113_record_function(name: str):
+    if os.environ.get("MATRIS_P113_RECORD_FUNCTION", "0") == "1":
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
+
+
 def _use_p77_fp32_gated_tail_forward(module_name: str) -> bool:
     use_p77 = os.environ.get("MATRIS_P77_FP32_GATED_TAIL_FORWARD", "0") == "1"
     use_p78 = os.environ.get("MATRIS_P78_FP32_GATED_TAIL_FORWARD", "0") == "1"
@@ -4617,6 +4786,191 @@ class _CudaParamGradGatedTail(torch.autograd.Function):
             grad_core_bias,
             grad_gate_weight,
             grad_gate_bias,
+            None,
+        )
+
+
+class _P113GatedTailSecondSiluMacro(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        core_first: Tensor,
+        gate_first: Tensor,
+        core_second_weight: Tensor,
+        core_second_bias: Tensor | None,
+        gate_second_weight: Tensor,
+        gate_second_bias: Tensor | None,
+        core_norm_weight: Tensor,
+        core_norm_bias: Tensor,
+        gate_norm_weight: Tensor,
+        gate_norm_bias: Tensor,
+        eps: float,
+        use_tail_bwd_v2: bool,
+        module_name: str,
+    ) -> Tensor:
+        with _p113_record_function(f"P113.gated_tail_second.{module_name}.forward"):
+            core_second_in = F.silu(core_first)
+            gate_second_in = F.silu(gate_first)
+            core_second = F.linear(core_second_in, core_second_weight, core_second_bias)
+            gate_second = F.linear(gate_second_in, gate_second_weight, gate_second_bias)
+            core_ln = F.layer_norm(core_second, (core_second.shape[-1],), core_norm_weight, core_norm_bias, eps)
+            gate_ln = F.layer_norm(gate_second, (gate_second.shape[-1],), gate_norm_weight, gate_norm_bias, eps)
+            out = F.silu(core_ln) * torch.sigmoid(gate_ln)
+        ctx.save_for_backward(
+            core_second,
+            gate_second,
+            core_norm_weight,
+            core_norm_bias,
+            gate_norm_weight,
+            gate_norm_bias,
+            core_second_weight,
+            gate_second_weight,
+            core_first,
+            gate_first,
+        )
+        ctx.eps = float(eps)
+        ctx.use_tail_bwd_v2 = bool(use_tail_bwd_v2)
+        ctx.module_name = str(module_name)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        (
+            core_second,
+            gate_second,
+            core_norm_weight,
+            core_norm_bias,
+            gate_norm_weight,
+            gate_norm_bias,
+            core_second_weight,
+            gate_second_weight,
+            core_first,
+            gate_first,
+        ) = ctx.saved_tensors
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "gated_tail_second_silu_input_grad_macro"):
+            raise RuntimeError("matris_op.gated_tail_second_silu_input_grad_macro is unavailable")
+        with _p113_record_function(f"P113.gated_tail_second.{ctx.module_name}.backward"):
+            grad_core_first, grad_gate_first = matris_op.gated_tail_second_silu_input_grad_macro(
+                grad_out.contiguous(),
+                core_second.contiguous(),
+                gate_second.contiguous(),
+                core_norm_weight.contiguous(),
+                core_norm_bias.contiguous(),
+                gate_norm_weight.contiguous(),
+                gate_norm_bias.contiguous(),
+                ctx.eps,
+                core_second_weight.contiguous(),
+                gate_second_weight.contiguous(),
+                core_first.contiguous(),
+                gate_first.contiguous(),
+                ctx.use_tail_bwd_v2,
+            )
+        return grad_core_first, grad_gate_first, None, None, None, None, None, None, None, None, None, None, None
+
+
+class _P116GatedTailSecondSiluResidualMacro(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        core_first: Tensor,
+        gate_first: Tensor,
+        core_second_weight: Tensor,
+        core_second_bias: Tensor | None,
+        gate_second_weight: Tensor,
+        gate_second_bias: Tensor | None,
+        core_norm_weight: Tensor,
+        core_norm_bias: Tensor,
+        gate_norm_weight: Tensor,
+        gate_norm_bias: Tensor,
+        eps: float,
+        use_tail_bwd_v2: bool,
+        old_feat: Tensor,
+        res_weight: Tensor,
+        module_name: str,
+    ) -> Tensor:
+        with _p113_record_function(f"P116.gated_tail_second_residual.{module_name}.forward"):
+            core_second_in = F.silu(core_first)
+            gate_second_in = F.silu(gate_first)
+            core_second = F.linear(core_second_in, core_second_weight, core_second_bias)
+            gate_second = F.linear(gate_second_in, gate_second_weight, gate_second_bias)
+            core_ln = F.layer_norm(core_second, (core_second.shape[-1],), core_norm_weight, core_norm_bias, eps)
+            gate_ln = F.layer_norm(gate_second, (gate_second.shape[-1],), gate_norm_weight, gate_norm_bias, eps)
+            update = F.silu(core_ln) * torch.sigmoid(gate_ln)
+            out = update + res_weight * old_feat
+        ctx.save_for_backward(
+            core_second,
+            gate_second,
+            core_norm_weight,
+            core_norm_bias,
+            gate_norm_weight,
+            gate_norm_bias,
+            core_second_weight,
+            gate_second_weight,
+            core_first,
+            gate_first,
+            old_feat,
+            res_weight,
+        )
+        ctx.eps = float(eps)
+        ctx.use_tail_bwd_v2 = bool(use_tail_bwd_v2)
+        ctx.module_name = str(module_name)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        (
+            core_second,
+            gate_second,
+            core_norm_weight,
+            core_norm_bias,
+            gate_norm_weight,
+            gate_norm_bias,
+            core_second_weight,
+            gate_second_weight,
+            core_first,
+            gate_first,
+            old_feat,
+            res_weight,
+        ) = ctx.saved_tensors
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "gated_tail_second_silu_residual_input_grad_macro"):
+            raise RuntimeError("matris_op.gated_tail_second_silu_residual_input_grad_macro is unavailable")
+        with _p113_record_function(f"P116.gated_tail_second_residual.{ctx.module_name}.backward"):
+            grad_core_first, grad_gate_first, grad_old, grad_res_weight = (
+                matris_op.gated_tail_second_silu_residual_input_grad_macro(
+                    grad_out.contiguous(),
+                    core_second.contiguous(),
+                    gate_second.contiguous(),
+                    core_norm_weight.contiguous(),
+                    core_norm_bias.contiguous(),
+                    gate_norm_weight.contiguous(),
+                    gate_norm_bias.contiguous(),
+                    ctx.eps,
+                    core_second_weight.contiguous(),
+                    gate_second_weight.contiguous(),
+                    core_first.contiguous(),
+                    gate_first.contiguous(),
+                    ctx.use_tail_bwd_v2,
+                    old_feat.contiguous(),
+                    res_weight.contiguous(),
+                )
+            )
+        return (
+            grad_core_first,
+            grad_gate_first,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            grad_old,
+            grad_res_weight,
             None,
         )
 
@@ -6215,6 +6569,73 @@ class FusedInputGatedMLP(nn.Module):
                 return fused_second_tail
             fused_silu_second = self._triton_w8a8_static_fused_silu_second(core, gate)
             if fused_silu_second is None:
+                if (
+                    _use_p113_gated_tail_second_silu_macro()
+                    and self.training is False
+                    and torch.is_grad_enabled()
+                    and self.core_second_prefix is not None
+                    and self.gate_second_prefix is not None
+                    and self._is_silu_dropout0_prefix(self.core_second_prefix)
+                    and self._is_silu_dropout0_prefix(self.gate_second_prefix)
+                    and self.core_post_second_tail is not None
+                    and self.gate_post_second_tail is not None
+                    and len(self.core_post_second_tail) == 0
+                    and len(self.gate_post_second_tail) == 0
+                    and self.fused_tail is not None
+                    and isinstance(self.core_second, nn.Linear)
+                    and isinstance(self.gate_second, nn.Linear)
+                    and isinstance(self.fused_tail.core_norm, nn.LayerNorm)
+                    and isinstance(self.fused_tail.gate_norm, nn.LayerNorm)
+                    and self.fused_tail.core_norm.normalized_shape == self.fused_tail.gate_norm.normalized_shape
+                    and self.fused_tail.core_norm.eps == self.fused_tail.gate_norm.eps
+                    and self.fused_tail.core_norm.elementwise_affine
+                    and self.fused_tail.gate_norm.elementwise_affine
+                    and self.fused_tail.core_norm.weight is not None
+                    and self.fused_tail.core_norm.bias is not None
+                    and self.fused_tail.gate_norm.weight is not None
+                    and self.fused_tail.gate_norm.bias is not None
+                    and isinstance(self.fused_tail.activation_func, FusedSiLU)
+                    and isinstance(self.fused_tail.activation_gate, FusedSigmoid)
+                    and core.is_cuda
+                    and gate.is_cuda
+                    and core.dtype == torch.float32
+                    and gate.dtype == torch.float32
+                    and core.ndim == 2
+                    and gate.shape == core.shape
+                    and core.shape[-1] in (128, 256)
+                    and self.core_second.weight.shape == (core.shape[-1], core.shape[-1])
+                    and self.gate_second.weight.shape == (core.shape[-1], core.shape[-1])
+                    and self.core_second.weight.dtype == torch.float32
+                    and self.gate_second.weight.dtype == torch.float32
+                    and self.core_second.weight.is_cuda
+                    and self.gate_second.weight.is_cuda
+                    and (self.core_second.bias is None or (self.core_second.bias.is_cuda and self.core_second.bias.dtype == torch.float32))
+                    and (self.gate_second.bias is None or (self.gate_second.bias.is_cuda and self.gate_second.bias.dtype == torch.float32))
+                    and self.fused_tail.core_norm.weight.is_cuda
+                    and self.fused_tail.core_norm.bias.is_cuda
+                    and self.fused_tail.gate_norm.weight.is_cuda
+                    and self.fused_tail.gate_norm.bias.is_cuda
+                    and self.fused_tail.core_norm.weight.dtype == torch.float32
+                    and self.fused_tail.core_norm.bias.dtype == torch.float32
+                    and self.fused_tail.gate_norm.weight.dtype == torch.float32
+                    and self.fused_tail.gate_norm.bias.dtype == torch.float32
+                    and (lambda op: op is not None and hasattr(op, "gated_tail_second_silu_input_grad_macro"))(_load_matris_op())
+                ):
+                    return _P113GatedTailSecondSiluMacro.apply(
+                        core,
+                        gate,
+                        self.core_second.weight,
+                        self.core_second.bias,
+                        self.gate_second.weight,
+                        self.gate_second.bias,
+                        self.fused_tail.core_norm.weight,
+                        self.fused_tail.core_norm.bias,
+                        self.fused_tail.gate_norm.weight,
+                        self.fused_tail.gate_norm.bias,
+                        self.fused_tail.core_norm.eps,
+                        bool(core.shape[-1] == 128 and os.environ.get("MATRIS_P113_USE_TAIL_BWD_V2", "1") == "1"),
+                        self.module_name,
+                    )
                 core = self.core_second_prefix(core)
                 gate = self.gate_second_prefix(gate)
                 core, gate = self._fused_second_projection(core, gate)
@@ -6256,6 +6677,103 @@ class FusedInputGatedMLP(nn.Module):
         if self.activation_func is None or self.activation_gate is None:
             raise RuntimeError("GatedMLP tail is missing activation modules.")
         return self.activation_func(core) * self.activation_gate(gate)
+
+    def forward_with_residual_after_first_projection(
+        self,
+        feas: Tensor,
+        old_feat: Tensor,
+        res_weight: Tensor,
+    ) -> Tensor | None:
+        if not (
+            _use_p116_gated_tail_second_residual_macro()
+            and _use_p113_gated_tail_second_silu_macro()
+            and self.training is False
+            and torch.is_grad_enabled()
+            and self.fused_first is not None
+            and self.core_second is not None
+            and self.gate_second is not None
+            and self.core_second_prefix is not None
+            and self.gate_second_prefix is not None
+            and self._is_silu_dropout0_prefix(self.core_second_prefix)
+            and self._is_silu_dropout0_prefix(self.gate_second_prefix)
+            and self.core_post_second_tail is not None
+            and self.gate_post_second_tail is not None
+            and len(self.core_post_second_tail) == 0
+            and len(self.gate_post_second_tail) == 0
+            and self.fused_tail is not None
+            and isinstance(self.core_second, nn.Linear)
+            and isinstance(self.gate_second, nn.Linear)
+            and isinstance(self.fused_tail.core_norm, nn.LayerNorm)
+            and isinstance(self.fused_tail.gate_norm, nn.LayerNorm)
+            and self.fused_tail.core_norm.normalized_shape == self.fused_tail.gate_norm.normalized_shape
+            and self.fused_tail.core_norm.eps == self.fused_tail.gate_norm.eps
+            and self.fused_tail.core_norm.elementwise_affine
+            and self.fused_tail.gate_norm.elementwise_affine
+            and self.fused_tail.core_norm.weight is not None
+            and self.fused_tail.core_norm.bias is not None
+            and self.fused_tail.gate_norm.weight is not None
+            and self.fused_tail.gate_norm.bias is not None
+            and isinstance(self.fused_tail.activation_func, FusedSiLU)
+            and isinstance(self.fused_tail.activation_gate, FusedSigmoid)
+            and feas.is_cuda
+            and old_feat.is_cuda
+            and res_weight.is_cuda
+            and feas.dtype == torch.float32
+            and old_feat.dtype == torch.float32
+            and res_weight.dtype == torch.float32
+            and old_feat.ndim == 2
+            and res_weight.ndim == 2
+            and res_weight.shape[0] == 1
+            and old_feat.shape[1] == res_weight.shape[1]
+        ):
+            return None
+        projected = self._fused_first_projection(feas)
+        core, gate = projected
+        if not (
+            core.is_cuda
+            and gate.is_cuda
+            and core.dtype == torch.float32
+            and gate.dtype == torch.float32
+            and core.ndim == 2
+            and gate.shape == core.shape
+            and old_feat.shape == core.shape
+            and core.shape[-1] in (128, 256)
+            and self.core_second.weight.shape == (core.shape[-1], core.shape[-1])
+            and self.gate_second.weight.shape == (core.shape[-1], core.shape[-1])
+            and self.core_second.weight.dtype == torch.float32
+            and self.gate_second.weight.dtype == torch.float32
+            and self.core_second.weight.is_cuda
+            and self.gate_second.weight.is_cuda
+            and (self.core_second.bias is None or (self.core_second.bias.is_cuda and self.core_second.bias.dtype == torch.float32))
+            and (self.gate_second.bias is None or (self.gate_second.bias.is_cuda and self.gate_second.bias.dtype == torch.float32))
+            and self.fused_tail.core_norm.weight.is_cuda
+            and self.fused_tail.core_norm.bias.is_cuda
+            and self.fused_tail.gate_norm.weight.is_cuda
+            and self.fused_tail.gate_norm.bias.is_cuda
+            and self.fused_tail.core_norm.weight.dtype == torch.float32
+            and self.fused_tail.core_norm.bias.dtype == torch.float32
+            and self.fused_tail.gate_norm.weight.dtype == torch.float32
+            and self.fused_tail.gate_norm.bias.dtype == torch.float32
+            and (lambda op: op is not None and hasattr(op, "gated_tail_second_silu_residual_input_grad_macro"))(_load_matris_op())
+        ):
+            return None
+        return _P116GatedTailSecondSiluResidualMacro.apply(
+            core,
+            gate,
+            self.core_second.weight,
+            self.core_second.bias,
+            self.gate_second.weight,
+            self.gate_second.bias,
+            self.fused_tail.core_norm.weight,
+            self.fused_tail.core_norm.bias,
+            self.fused_tail.gate_norm.weight,
+            self.fused_tail.gate_norm.bias,
+            self.fused_tail.core_norm.eps,
+            bool(core.shape[-1] == 128 and os.environ.get("MATRIS_P113_USE_TAIL_BWD_V2", "1") == "1"),
+            old_feat,
+            res_weight,
+            self.module_name,
+        )
 
     def _forward_impl(self, feas: Tensor) -> Tensor:
         core, gate = self._fused_first_projection(feas)
@@ -6440,6 +6958,86 @@ class FusedInputGatedMLP(nn.Module):
         projected = _LineEdgeFirstProjection.apply(
             node_feat,
             edge_feat,
+            source_index,
+            target_index,
+            self.fused_first.weight,
+            self.fused_first.bias,
+        )
+        core, gate = projected.split([self.core_hidden_dim, self.gate_hidden_dim], dim=-1)
+        return self._forward_after_first_projection(core, gate)
+
+    def forward_refine_atom_edge(
+        self,
+        node_feat: Tensor,
+        edge_feat: Tensor,
+        edge_index: Tensor,
+        source_index: Tensor,
+        target_index: Tensor,
+    ) -> Tensor | None:
+        rows = int(source_index.shape[0]) if source_index.ndim > 0 else 0
+        use_p110 = _use_p110_refine_atom_edge_update(rows)
+        use_p111 = _use_p111_refine_atom_fused_first(rows)
+        if not (use_p110 or use_p111):
+            return None
+        if self.fused_first is None:
+            return None
+        if not (
+            node_feat.is_cuda
+            and edge_feat.is_cuda
+            and edge_index.is_cuda
+            and source_index.is_cuda
+            and target_index.is_cuda
+            and node_feat.dtype == torch.float32
+            and edge_feat.dtype == torch.float32
+            and edge_index.dtype == torch.int64
+            and source_index.dtype == torch.int64
+            and target_index.dtype == torch.int64
+            and node_feat.ndim == 2
+            and edge_feat.ndim == 2
+            and node_feat.shape[1] == 128
+            and edge_feat.shape[1] == 128
+            and edge_index.ndim == 1
+            and source_index.ndim == 1
+            and target_index.ndim == 1
+            and edge_index.shape[0] == source_index.shape[0]
+            and target_index.shape[0] == source_index.shape[0]
+            and self.fused_first.in_features == 384
+            and self.fused_first.out_features == self.core_hidden_dim + self.gate_hidden_dim
+        ):
+            return None
+        matris_op = _load_matris_op()
+        if matris_op is None or not (
+            hasattr(matris_op, "directed_edge_gather_cat_forward")
+            and hasattr(matris_op, "directed_edge_cat_grad_scatter_backward")
+        ):
+            return None
+        if (
+            use_p111
+            and self.training is False
+            and torch.is_grad_enabled()
+            and isinstance(self.fused_first, nn.Linear)
+            and self.fused_first.weight.shape == (256, 384)
+            and self.core_hidden_dim == 128
+            and self.gate_hidden_dim == 128
+            and self.core_second_prefix is not None
+            and self.gate_second_prefix is not None
+            and self._is_silu_dropout0_prefix(self.core_second_prefix)
+            and self._is_silu_dropout0_prefix(self.gate_second_prefix)
+        ):
+            core, gate = _P111RefineAtomFirstSilu.apply(
+                node_feat,
+                edge_feat,
+                edge_index,
+                source_index,
+                target_index,
+                self.fused_first.weight,
+                self.fused_first.bias,
+            )
+            return self._forward_after_first_activation(core, gate)
+        projected = _RefineAtomEdgeFirstProjection.apply(
+            node_feat,
+            edge_feat,
+            edge_index,
             source_index,
             target_index,
             self.fused_first.weight,

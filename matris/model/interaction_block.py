@@ -173,10 +173,53 @@ def _p101_use_node_input_attention() -> bool:
     return os.environ.get("MATRIS_P101_USE_NODE_INPUT_ATTENTION", "1") == "1"
 
 
+def _p105_use_attn_line_edge_alpha_cuda_bwd() -> bool:
+    return os.environ.get("MATRIS_P105_A_CUDA1_ATTN_LINE_EDGE_ALPHA_BWD", "0") == "1"
+
+
+def _p106_use_attention_backward_edge_direct() -> bool:
+    return os.environ.get("MATRIS_P106_A_CUDA2_ATTN_LINE_BWD_EDGE_DIRECT", "0") == "1"
+
+
+def _p107_use_attention_alpha_project_fused() -> bool:
+    return os.environ.get("MATRIS_P107_A_CUDA2_ATTN_ALPHA_PROJECT_FUSED", "0") == "1"
+
+
+def _p108_use_attn_line_target_reduce_bwd() -> bool:
+    return os.environ.get("MATRIS_P108_A_CUDA3_ATTN_LINE_TARGET_REDUCE_BWD", "0") == "1"
+
+
+def _p108_use_attn_line_alpha_tiled_bwd() -> bool:
+    return os.environ.get("MATRIS_P108_A_CUDA3_ATTN_LINE_ALPHA_TILED_BWD", "0") == "1"
+
+
+def _p108_use_attn_line_dense_gemm_scatter_bwd() -> bool:
+    return os.environ.get("MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_SCATTER_BWD", "0") == "1"
+
+
+def _p108_use_attn_line_dense_gemm_op_bwd() -> bool:
+    return os.environ.get("MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_OP_BWD", "0") == "1"
+
+
+def _p108_attn_line_dense_gemm_scatter_threshold() -> int:
+    return int(os.environ.get("MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_SCATTER_THRESHOLD", "4096"))
+
+
 def _use_p58_refine_line_smooth_reduce(profile_prefix: str) -> bool:
     if os.environ.get("MATRIS_P58_REFINE_LINE_SMOOTH_REDUCE", "0") != "1":
         return False
     return profile_prefix.endswith(".refine_line")
+
+
+def _use_p58_refine_line_smooth_reduce_sorted(profile_prefix: str) -> bool:
+    if os.environ.get("MATRIS_P58_REFINE_LINE_SMOOTH_REDUCE_SORTED", "0") != "1":
+        return False
+    return profile_prefix.endswith(".refine_line")
+
+
+def _refine_line_target_index_is_sorted(graph: dict[str, Tensor]) -> bool:
+    target_offsets = graph.get("target_segment_offsets")
+    return target_offsets is not None
 
 
 def _use_p58_refine_line_edge_update(profile_prefix: str) -> bool:
@@ -661,6 +704,191 @@ def _p53b_gated_backward(grad_out: Tensor, cache: dict[str, Any]) -> Tensor:
     return _p53b_linear_backward(grad_core, core_first_cache) + _p53b_linear_backward(grad_gate, gate_first_cache)
 
 
+def _p53b_gated_second_tail_projected_grad(
+    grad_out: Tensor,
+    core_second_out: Tensor,
+    gate_second_out: Tensor,
+    core_norm_weight: Tensor,
+    core_norm_bias: Tensor,
+    gate_norm_weight: Tensor,
+    gate_norm_bias: Tensor,
+    eps_tensor: Tensor,
+    core_second_weight: Tensor,
+    gate_second_weight: Tensor,
+    core_first_hidden: Tensor,
+    gate_first_hidden: Tensor,
+) -> Tensor:
+    eps = eps_tensor.reshape(())
+    core_centered = core_second_out - core_second_out.mean(dim=1, keepdim=True)
+    gate_centered = gate_second_out - gate_second_out.mean(dim=1, keepdim=True)
+    core_rstd = torch.rsqrt((core_centered * core_centered).mean(dim=1, keepdim=True) + eps)
+    gate_rstd = torch.rsqrt((gate_centered * gate_centered).mean(dim=1, keepdim=True) + eps)
+    core_xhat = core_centered * core_rstd
+    gate_xhat = gate_centered * gate_rstd
+    core_ln = core_xhat * core_norm_weight.reshape(1, -1) + core_norm_bias.reshape(1, -1)
+    gate_ln = gate_xhat * gate_norm_weight.reshape(1, -1) + gate_norm_bias.reshape(1, -1)
+    core_sig = torch.sigmoid(core_ln)
+    gate_act = torch.sigmoid(gate_ln)
+    core_act = core_ln * core_sig
+    core_silu_grad = core_sig * (1.0 + core_ln * (1.0 - core_sig))
+    grad_core_norm = grad_out.float() * gate_act * core_silu_grad * core_norm_weight.reshape(1, -1)
+    grad_gate_norm = grad_out.float() * core_act * gate_act * (1.0 - gate_act) * gate_norm_weight.reshape(1, -1)
+    dim = grad_out.shape[1]
+    grad_core_second = (
+        (
+            grad_core_norm * dim
+            - grad_core_norm.sum(dim=1, keepdim=True)
+            - core_xhat * (grad_core_norm * core_xhat).sum(dim=1, keepdim=True)
+        )
+        * core_rstd
+        / dim
+    )
+    grad_gate_second = (
+        (
+            grad_gate_norm * dim
+            - grad_gate_norm.sum(dim=1, keepdim=True)
+            - gate_xhat * (grad_gate_norm * gate_xhat).sum(dim=1, keepdim=True)
+        )
+        * gate_rstd
+        / dim
+    )
+    grad_core_first = grad_core_second.matmul(core_second_weight) * _p53b_silu_grad(core_first_hidden)
+    grad_gate_first = grad_gate_second.matmul(gate_second_weight) * _p53b_silu_grad(gate_first_hidden)
+    return torch.cat([grad_core_first, grad_gate_first], dim=1)
+
+
+def _p116_gated_second_tail_residual_forward_or_none(
+    module: nn.Module,
+    x: Tensor,
+    old_feat: Tensor,
+    res_weight: Tensor,
+) -> tuple[Tensor, dict[str, Any]] | None:
+    if os.environ.get("MATRIS_P116_GATED_TAIL_SECOND_RESIDUAL_MACRO", "0") != "1":
+        return None
+    if not (
+        hasattr(module, "fused_first")
+        and getattr(module, "fused_first", None) is not None
+        and getattr(module, "core_second", None) is not None
+        and getattr(module, "gate_second", None) is not None
+        and getattr(module, "fused_tail", None) is not None
+        and isinstance(module.core_second, nn.Linear)
+        and isinstance(module.gate_second, nn.Linear)
+        and isinstance(module.fused_tail.core_norm, nn.LayerNorm)
+        and isinstance(module.fused_tail.gate_norm, nn.LayerNorm)
+        and module.fused_tail.core_norm.weight is not None
+        and module.fused_tail.core_norm.bias is not None
+        and module.fused_tail.gate_norm.weight is not None
+        and module.fused_tail.gate_norm.bias is not None
+        and x.is_cuda
+        and old_feat.is_cuda
+        and res_weight.is_cuda
+        and x.dtype == torch.float32
+        and old_feat.dtype == torch.float32
+        and res_weight.dtype == torch.float32
+    ):
+        return None
+
+    core_hidden_dim = int(module.core_hidden_dim)
+    gate_hidden_dim = int(module.gate_hidden_dim)
+    projected, first_cache = _p53b_linear_forward(x, module.fused_first)
+    core_first, gate_first = projected.split([core_hidden_dim, gate_hidden_dim], dim=-1)
+    if not (
+        core_first.shape == gate_first.shape == old_feat.shape
+        and core_first.ndim == 2
+        and core_first.shape[-1] in (128, 256)
+        and res_weight.ndim == 2
+        and res_weight.shape == (1, core_first.shape[-1])
+        and module.core_second.weight.shape == (core_first.shape[-1], core_first.shape[-1])
+        and module.gate_second.weight.shape == (core_first.shape[-1], core_first.shape[-1])
+        and module.core_second.weight.dtype == torch.float32
+        and module.gate_second.weight.dtype == torch.float32
+        and module.core_second.weight.is_cuda
+        and module.gate_second.weight.is_cuda
+    ):
+        return None
+
+    core_second_in = F.silu(core_first)
+    gate_second_in = F.silu(gate_first)
+    core_second, core_second_cache = _p53b_linear_forward(core_second_in, module.core_second)
+    gate_second, gate_second_cache = _p53b_linear_forward(gate_second_in, module.gate_second)
+    core_update, tail_cache = _p53b_tail_forward(
+        core_second,
+        gate_second,
+        module.fused_tail.core_norm,
+        module.fused_tail.gate_norm,
+    )
+    return core_update + res_weight.float() * old_feat, {
+        "kind": "p116_fused_gated_residual",
+        "first": first_cache,
+        "core_first": core_first,
+        "gate_first": gate_first,
+        "core_second": core_second_cache,
+        "gate_second": gate_second_cache,
+        "tail": tail_cache,
+        "old_feat": old_feat,
+        "res_weight": res_weight.float(),
+    }
+
+
+def _p116_gated_second_tail_residual_backward_or_none(
+    grad_out: Tensor,
+    cache: dict[str, Any],
+) -> tuple[Tensor, Tensor] | None:
+    if os.environ.get("MATRIS_P116_GATED_TAIL_SECOND_RESIDUAL_MACRO", "0") != "1":
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "gated_tail_second_silu_residual_input_grad_macro"):
+        return None
+    tail = cache["tail"]
+    core_second_weight = cache["core_second"][0]
+    gate_second_weight = cache["gate_second"][0]
+    core_first = cache["core_first"]
+    gate_first = cache["gate_first"]
+    old_feat = cache["old_feat"]
+    res_weight = cache["res_weight"]
+    if not (
+        isinstance(tail.get("core_weight"), Tensor)
+        and isinstance(tail.get("core_bias"), Tensor)
+        and isinstance(tail.get("gate_weight"), Tensor)
+        and isinstance(tail.get("gate_bias"), Tensor)
+        and grad_out.is_cuda
+        and core_first.is_cuda
+        and gate_first.is_cuda
+        and old_feat.is_cuda
+        and res_weight.is_cuda
+        and core_second_weight.is_cuda
+        and gate_second_weight.is_cuda
+        and grad_out.dtype == torch.float32
+        and core_first.dtype == torch.float32
+        and gate_first.dtype == torch.float32
+        and old_feat.dtype == torch.float32
+        and res_weight.dtype == torch.float32
+        and grad_out.shape == old_feat.shape == tail["core"].shape == tail["gate"].shape
+        and core_first.shape == gate_first.shape == grad_out.shape
+    ):
+        return None
+    grad_core, grad_gate, grad_old, _grad_res_weight = matris_op.gated_tail_second_silu_residual_input_grad_macro(
+        grad_out.contiguous(),
+        tail["core"].contiguous(),
+        tail["gate"].contiguous(),
+        tail["core_weight"].contiguous(),
+        tail["core_bias"].contiguous(),
+        tail["gate_weight"].contiguous(),
+        tail["gate_bias"].contiguous(),
+        tail["eps"],
+        core_second_weight.contiguous(),
+        gate_second_weight.contiguous(),
+        core_first.contiguous(),
+        gate_first.contiguous(),
+        bool(core_first.shape[-1] == 128 and os.environ.get("MATRIS_P113_USE_TAIL_BWD_V2", "1") == "1"),
+        old_feat.contiguous(),
+        res_weight.contiguous(),
+    )
+    grad_first = torch.cat([grad_core, grad_gate], dim=-1)
+    grad_x = _p53b_linear_backward(grad_first, cache["first"])
+    return grad_x, grad_old
+
+
 def _p53b_apply_update(module: nn.Module, x: Tensor) -> tuple[Tensor, dict[str, Any]]:
     if hasattr(module, "fused_first") or hasattr(module, "mlp_core"):
         return _p53b_gated_forward(module, x)
@@ -813,6 +1041,93 @@ def _p53b_attention_backward(
     return grad_source_logits, grad_target_logits, grad_values_source + grad_values_target
 
 
+def _p106_attention_backward_edge_direct_or_none(
+    grad_source_out: Tensor,
+    grad_target_out: Tensor,
+    grad_edge_direct: Tensor,
+    cache: dict[str, Any],
+) -> tuple[Tensor, Tensor, Tensor] | None:
+    if not _p106_use_attention_backward_edge_direct():
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "fused_line_attention_backward_with_edge_direct"):
+        return None
+    values = cache["values"]
+    source_alpha = cache["source_alpha"]
+    target_alpha = cache["target_alpha"]
+    if not (
+        grad_source_out.is_cuda
+        and grad_target_out.is_cuda
+        and grad_edge_direct.is_cuda
+        and values.is_cuda
+        and cache["source_out"].is_cuda
+        and cache["target_out"].is_cuda
+        and source_alpha.is_cuda
+        and target_alpha.is_cuda
+        and grad_source_out.dtype == torch.float32
+        and grad_target_out.dtype == torch.float32
+        and grad_edge_direct.dtype == torch.float32
+        and values.dtype == torch.float32
+        and source_alpha.dtype == torch.float32
+        and target_alpha.dtype == torch.float32
+        and grad_edge_direct.shape == values.shape
+    ):
+        return None
+    return matris_op.fused_line_attention_backward_with_edge_direct(
+        grad_source_out.contiguous(),
+        grad_target_out.contiguous(),
+        grad_edge_direct.contiguous(),
+        values.contiguous(),
+        cache["source_out"].contiguous(),
+        cache["target_out"].contiguous(),
+        source_alpha.contiguous(),
+        target_alpha.contiguous(),
+        cache["source_index"].contiguous(),
+        cache["target_index"].contiguous(),
+    )
+
+
+def _p107_attention_values_backward_edge_direct_or_none(
+    grad_source_out: Tensor,
+    grad_target_out: Tensor,
+    grad_edge_direct: Tensor,
+    cache: dict[str, Any],
+) -> Tensor | None:
+    if not _p107_use_attention_alpha_project_fused():
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "fused_line_attention_values_backward_with_edge_direct"):
+        return None
+    values = cache["values"]
+    source_alpha = cache["source_alpha"]
+    target_alpha = cache["target_alpha"]
+    if not (
+        grad_source_out.is_cuda
+        and grad_target_out.is_cuda
+        and grad_edge_direct.is_cuda
+        and values.is_cuda
+        and source_alpha.is_cuda
+        and target_alpha.is_cuda
+        and grad_source_out.dtype == torch.float32
+        and grad_target_out.dtype == torch.float32
+        and grad_edge_direct.dtype == torch.float32
+        and values.dtype == torch.float32
+        and source_alpha.dtype == torch.float32
+        and target_alpha.dtype == torch.float32
+        and grad_edge_direct.shape == values.shape
+    ):
+        return None
+    return matris_op.fused_line_attention_values_backward_with_edge_direct(
+        grad_source_out.contiguous(),
+        grad_target_out.contiguous(),
+        grad_edge_direct.contiguous(),
+        source_alpha.contiguous(),
+        target_alpha.contiguous(),
+        cache["source_index"].contiguous(),
+        cache["target_index"].contiguous(),
+    )
+
+
 def _p53b_attention_layer_forward(
     layer: nn.Module,
     node_feat: Tensor,
@@ -851,8 +1166,17 @@ def _p53b_attention_layer_forward(
         edge_update = edge_values
         directed_cache = None
     node_x = torch.cat([node_feat, target_out, source_out], dim=1)
-    node_update, node_cache = _p53b_apply_update(layer.node_nonlinear_update, node_x)
-    node_out = node_update + layer.node_res_weight.float() * node_feat
+    fused_node_residual = _p116_gated_second_tail_residual_forward_or_none(
+        layer.node_nonlinear_update,
+        node_x,
+        node_feat,
+        layer.node_res_weight,
+    )
+    if fused_node_residual is None:
+        node_update, node_cache = _p53b_apply_update(layer.node_nonlinear_update, node_x)
+        node_out = node_update + layer.node_res_weight.float() * node_feat
+    else:
+        node_out, node_cache = fused_node_residual
     edge_out = edge_update + layer.edge_res_weight.float() * edge_feat
     return node_out, edge_out, {
         "is_atom": is_atom,
@@ -1083,6 +1407,590 @@ def _p101_attention_node_input_backward(
     return grad_node_direct, grad_source_logits, grad_target_logits, grad_values
 
 
+def _p106_attention_node_input_backward_edge_direct_or_none(
+    grad_fusion_node_feat: Tensor,
+    cache: dict[str, Any],
+    grad_edge_direct: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    dim = grad_fusion_node_feat.shape[-1] // 3
+    grad_node_direct = grad_fusion_node_feat[:, :dim].contiguous()
+    grad_target_out = grad_fusion_node_feat[:, dim : 2 * dim].contiguous()
+    grad_source_out = grad_fusion_node_feat[:, 2 * dim :].contiguous()
+    if cache["kind"] == "cuda_node_input":
+        target_out = cache["fusion_node_feat"][:, dim : 2 * dim].contiguous()
+        source_out = cache["fusion_node_feat"][:, 2 * dim :].contiguous()
+        attn_cache = {
+            "source_index": cache["source_index"],
+            "target_index": cache["target_index"],
+            "source_alpha": cache["source_alpha"],
+            "target_alpha": cache["target_alpha"],
+            "source_out": source_out,
+            "target_out": target_out,
+            "values": cache["values"],
+        }
+    else:
+        attn_cache = cache
+    fused = _p106_attention_backward_edge_direct_or_none(
+        grad_source_out,
+        grad_target_out,
+        grad_edge_direct,
+        attn_cache,
+    )
+    if fused is None:
+        return None
+    grad_source_logits, grad_target_logits, grad_values = fused
+    return grad_node_direct, grad_source_logits, grad_target_logits, grad_values
+
+
+def _p107_attention_node_input_values_backward_or_none(
+    grad_fusion_node_feat: Tensor,
+    cache: dict[str, Any],
+    grad_edge_direct: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, dict[str, Any]] | None:
+    dim = grad_fusion_node_feat.shape[-1] // 3
+    grad_node_direct = grad_fusion_node_feat[:, :dim].contiguous()
+    grad_target_out = grad_fusion_node_feat[:, dim : 2 * dim].contiguous()
+    grad_source_out = grad_fusion_node_feat[:, 2 * dim :].contiguous()
+    if cache["kind"] == "cuda_node_input":
+        target_out = cache["fusion_node_feat"][:, dim : 2 * dim].contiguous()
+        source_out = cache["fusion_node_feat"][:, 2 * dim :].contiguous()
+        attn_cache = {
+            "source_index": cache["source_index"],
+            "target_index": cache["target_index"],
+            "source_alpha": cache["source_alpha"],
+            "target_alpha": cache["target_alpha"],
+            "source_out": source_out,
+            "target_out": target_out,
+            "values": cache["values"],
+        }
+    else:
+        attn_cache = cache
+    grad_values = _p107_attention_values_backward_edge_direct_or_none(
+        grad_source_out,
+        grad_target_out,
+        grad_edge_direct,
+        attn_cache,
+    )
+    if grad_values is None:
+        return None
+    return grad_node_direct, grad_source_out, grad_target_out, grad_values, attn_cache
+
+
+def _p105_edge_update_alpha_cuda_backward_or_none(
+    grad_edge_values: Tensor,
+    edge_cache: dict[str, Any],
+    grad_source_logits: Tensor,
+    grad_target_logits: Tensor,
+    source_linear_cache: tuple[Tensor],
+    target_linear_cache: tuple[Tensor],
+    source_index: Tensor,
+    target_index: Tensor,
+    node_rows: int,
+) -> tuple[Tensor, Tensor] | None:
+    if not _p105_use_attn_line_edge_alpha_cuda_bwd():
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "line_edge_silu_project_alpha_grad_scatter_backward_tile32"):
+        return None
+    if not (
+        edge_cache.get("kind") == "fused_gated"
+        and edge_cache.get("two_linear") is True
+        and edge_cache.get("split_first") is True
+        and isinstance(edge_cache.get("first"), tuple)
+    ):
+        return None
+    first_cache = edge_cache["first"]
+    if len(first_cache) != 1:
+        return None
+    first_weight = first_cache[0]
+    source_weight = source_linear_cache[0]
+    target_weight = target_linear_cache[0]
+    core_first = edge_cache.get("core_first")
+    gate_first = edge_cache.get("gate_first")
+    if not (
+        isinstance(core_first, Tensor)
+        and isinstance(gate_first, Tensor)
+        and grad_edge_values.is_cuda
+        and grad_source_logits.is_cuda
+        and grad_target_logits.is_cuda
+        and source_index.is_cuda
+        and target_index.is_cuda
+        and first_weight.is_cuda
+        and source_weight.is_cuda
+        and target_weight.is_cuda
+        and grad_edge_values.dtype == torch.float32
+        and grad_source_logits.dtype == torch.float32
+        and grad_target_logits.dtype == torch.float32
+        and core_first.dtype == torch.float32
+        and gate_first.dtype == torch.float32
+        and first_weight.dtype == torch.float32
+        and source_weight.dtype == torch.float32
+        and target_weight.dtype == torch.float32
+        and grad_edge_values.ndim == 2
+        and grad_source_logits.shape == grad_target_logits.shape == grad_edge_values.shape
+        and core_first.shape == gate_first.shape == grad_edge_values.shape
+        and grad_edge_values.shape[-1] == 128
+        and first_weight.shape == (256, 384)
+        and source_weight.shape == (128, 128)
+        and target_weight.shape == (128, 128)
+    ):
+        return None
+
+    grad_core, grad_gate = _p53b_tail_backward(grad_edge_values, edge_cache["tail"])
+    grad_core_second_in = _p53b_linear_backward(grad_core, edge_cache["core_second"])
+    grad_gate_second_in = _p53b_linear_backward(grad_gate, edge_cache["gate_second"])
+    grad_node, grad_edge = matris_op.line_edge_silu_project_alpha_grad_scatter_backward_tile32(
+        grad_core_second_in.contiguous(),
+        grad_gate_second_in.contiguous(),
+        core_first.contiguous(),
+        gate_first.contiguous(),
+        first_weight.contiguous(),
+        grad_source_logits.contiguous(),
+        grad_target_logits.contiguous(),
+        source_weight.contiguous(),
+        target_weight.contiguous(),
+        source_index.contiguous(),
+        target_index.contiguous(),
+        int(node_rows),
+    )
+    return grad_node, grad_edge
+
+
+def _p108_edge_update_alpha_tiled_cuda_backward_or_none(
+    grad_edge_values: Tensor,
+    edge_cache: dict[str, Any],
+    grad_source_logits: Tensor,
+    grad_target_logits: Tensor,
+    source_linear_cache: tuple[Tensor],
+    target_linear_cache: tuple[Tensor],
+    source_index: Tensor,
+    target_index: Tensor,
+    node_rows: int,
+) -> tuple[Tensor, Tensor] | None:
+    if not _p108_use_attn_line_alpha_tiled_bwd():
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "line_edge_silu_project_alpha_grad_scatter_backward_alpha_tile32"):
+        return None
+    if not (
+        edge_cache.get("kind") == "fused_gated"
+        and edge_cache.get("two_linear") is True
+        and edge_cache.get("split_first") is True
+        and isinstance(edge_cache.get("first"), tuple)
+    ):
+        return None
+    first_cache = edge_cache["first"]
+    if len(first_cache) != 1:
+        return None
+    first_weight = first_cache[0]
+    source_weight = source_linear_cache[0]
+    target_weight = target_linear_cache[0]
+    core_first = edge_cache.get("core_first")
+    gate_first = edge_cache.get("gate_first")
+    if not (
+        isinstance(core_first, Tensor)
+        and isinstance(gate_first, Tensor)
+        and grad_edge_values.is_cuda
+        and grad_source_logits.is_cuda
+        and grad_target_logits.is_cuda
+        and source_index.is_cuda
+        and target_index.is_cuda
+        and first_weight.is_cuda
+        and source_weight.is_cuda
+        and target_weight.is_cuda
+        and grad_edge_values.dtype == torch.float32
+        and grad_source_logits.dtype == torch.float32
+        and grad_target_logits.dtype == torch.float32
+        and core_first.dtype == torch.float32
+        and gate_first.dtype == torch.float32
+        and first_weight.dtype == torch.float32
+        and source_weight.dtype == torch.float32
+        and target_weight.dtype == torch.float32
+        and grad_edge_values.ndim == 2
+        and grad_source_logits.shape == grad_target_logits.shape == grad_edge_values.shape
+        and core_first.shape == gate_first.shape == grad_edge_values.shape
+        and grad_edge_values.shape[-1] == 128
+        and first_weight.shape == (256, 384)
+        and source_weight.shape == (128, 128)
+        and target_weight.shape == (128, 128)
+    ):
+        return None
+
+    grad_core, grad_gate = _p53b_tail_backward(grad_edge_values, edge_cache["tail"])
+    grad_core_second_in = _p53b_linear_backward(grad_core, edge_cache["core_second"])
+    grad_gate_second_in = _p53b_linear_backward(grad_gate, edge_cache["gate_second"])
+    grad_node, grad_edge = matris_op.line_edge_silu_project_alpha_grad_scatter_backward_alpha_tile32(
+        grad_core_second_in.contiguous(),
+        grad_gate_second_in.contiguous(),
+        core_first.contiguous(),
+        gate_first.contiguous(),
+        first_weight.contiguous(),
+        grad_source_logits.contiguous(),
+        grad_target_logits.contiguous(),
+        source_weight.contiguous(),
+        target_weight.contiguous(),
+        source_index.contiguous(),
+        target_index.contiguous(),
+        int(node_rows),
+    )
+    return grad_node, grad_edge
+
+
+def _p108_edge_update_alpha_dense_gemm_scatter_backward_or_none(
+    grad_edge_values: Tensor,
+    edge_cache: dict[str, Any],
+    grad_source_logits: Tensor,
+    grad_target_logits: Tensor,
+    source_linear_cache: tuple[Tensor],
+    target_linear_cache: tuple[Tensor],
+    source_index: Tensor,
+    target_index: Tensor,
+    node_rows: int,
+) -> tuple[Tensor, Tensor] | None:
+    if not _p108_use_attn_line_dense_gemm_scatter_bwd():
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "line_edge_cat_grad_scatter_backward"):
+        return None
+    if int(grad_edge_values.shape[0]) <= _p108_attn_line_dense_gemm_scatter_threshold():
+        return None
+    if not (
+        edge_cache.get("kind") == "fused_gated"
+        and edge_cache.get("two_linear") is True
+        and edge_cache.get("split_first") is True
+        and isinstance(edge_cache.get("first"), tuple)
+    ):
+        return None
+    first_cache = edge_cache["first"]
+    if len(first_cache) != 1:
+        return None
+    first_weight = first_cache[0]
+    source_weight = source_linear_cache[0]
+    target_weight = target_linear_cache[0]
+    core_first = edge_cache.get("core_first")
+    gate_first = edge_cache.get("gate_first")
+    if not (
+        isinstance(core_first, Tensor)
+        and isinstance(gate_first, Tensor)
+        and grad_edge_values.is_cuda
+        and grad_source_logits.is_cuda
+        and grad_target_logits.is_cuda
+        and source_index.is_cuda
+        and target_index.is_cuda
+        and first_weight.is_cuda
+        and source_weight.is_cuda
+        and target_weight.is_cuda
+        and grad_edge_values.dtype == torch.float32
+        and grad_source_logits.dtype == torch.float32
+        and grad_target_logits.dtype == torch.float32
+        and core_first.dtype == torch.float32
+        and gate_first.dtype == torch.float32
+        and first_weight.dtype == torch.float32
+        and source_weight.dtype == torch.float32
+        and target_weight.dtype == torch.float32
+        and grad_edge_values.ndim == 2
+        and grad_source_logits.shape == grad_target_logits.shape == grad_edge_values.shape
+        and core_first.shape == gate_first.shape == grad_edge_values.shape
+        and grad_edge_values.shape[-1] == 128
+        and first_weight.shape == (256, 384)
+        and source_weight.shape == (128, 128)
+        and target_weight.shape == (128, 128)
+    ):
+        return None
+
+    grad_core, grad_gate = _p53b_tail_backward(grad_edge_values, edge_cache["tail"])
+    grad_core_second_in = _p53b_linear_backward(grad_core, edge_cache["core_second"])
+    grad_gate_second_in = _p53b_linear_backward(grad_gate, edge_cache["gate_second"])
+    grad_core_first = grad_core_second_in * _p53b_silu_grad(core_first)
+    grad_gate_first = grad_gate_second_in * _p53b_silu_grad(gate_first)
+    grad_hidden = torch.cat([grad_core_first, grad_gate_first], dim=-1)
+    grad_cat = grad_hidden.matmul(first_weight.contiguous())
+    grad_alpha = grad_source_logits.contiguous().matmul(source_weight.contiguous())
+    grad_alpha = grad_alpha + grad_target_logits.contiguous().matmul(target_weight.contiguous())
+    grad_cat[:, :128] = grad_cat[:, :128] + grad_alpha
+    grad_node, grad_edge = matris_op.line_edge_cat_grad_scatter_backward(
+        grad_cat.contiguous(),
+        source_index.contiguous(),
+        target_index.contiguous(),
+        int(node_rows),
+    )
+    return grad_node, grad_edge
+
+
+def _p108_edge_update_alpha_dense_gemm_op_backward_or_none(
+    grad_edge_values: Tensor,
+    edge_cache: dict[str, Any],
+    grad_source_logits: Tensor,
+    grad_target_logits: Tensor,
+    source_linear_cache: tuple[Tensor],
+    target_linear_cache: tuple[Tensor],
+    source_index: Tensor,
+    target_index: Tensor,
+    node_rows: int,
+) -> tuple[Tensor, Tensor] | None:
+    if not _p108_use_attn_line_dense_gemm_op_bwd():
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "line_edge_silu_project_alpha_grad_scatter_backward_dense_gemm"):
+        return None
+    if int(grad_edge_values.shape[0]) <= _p108_attn_line_dense_gemm_scatter_threshold():
+        return None
+    if not (
+        edge_cache.get("kind") == "fused_gated"
+        and edge_cache.get("two_linear") is True
+        and edge_cache.get("split_first") is True
+        and isinstance(edge_cache.get("first"), tuple)
+    ):
+        return None
+    first_cache = edge_cache["first"]
+    if len(first_cache) != 1:
+        return None
+    first_weight = first_cache[0]
+    source_weight = source_linear_cache[0]
+    target_weight = target_linear_cache[0]
+    core_first = edge_cache.get("core_first")
+    gate_first = edge_cache.get("gate_first")
+    if not (
+        isinstance(core_first, Tensor)
+        and isinstance(gate_first, Tensor)
+        and grad_edge_values.is_cuda
+        and grad_source_logits.is_cuda
+        and grad_target_logits.is_cuda
+        and source_index.is_cuda
+        and target_index.is_cuda
+        and first_weight.is_cuda
+        and source_weight.is_cuda
+        and target_weight.is_cuda
+        and grad_edge_values.dtype == torch.float32
+        and grad_source_logits.dtype == torch.float32
+        and grad_target_logits.dtype == torch.float32
+        and core_first.dtype == torch.float32
+        and gate_first.dtype == torch.float32
+        and first_weight.dtype == torch.float32
+        and source_weight.dtype == torch.float32
+        and target_weight.dtype == torch.float32
+        and grad_edge_values.ndim == 2
+        and grad_source_logits.shape == grad_target_logits.shape == grad_edge_values.shape
+        and core_first.shape == gate_first.shape == grad_edge_values.shape
+        and grad_edge_values.shape[-1] == 128
+        and first_weight.shape == (256, 384)
+        and source_weight.shape == (128, 128)
+        and target_weight.shape == (128, 128)
+    ):
+        return None
+
+    grad_core, grad_gate = _p53b_tail_backward(grad_edge_values, edge_cache["tail"])
+    grad_core_second_in = _p53b_linear_backward(grad_core, edge_cache["core_second"])
+    grad_gate_second_in = _p53b_linear_backward(grad_gate, edge_cache["gate_second"])
+    grad_node, grad_edge = matris_op.line_edge_silu_project_alpha_grad_scatter_backward_dense_gemm(
+        grad_core_second_in.contiguous(),
+        grad_gate_second_in.contiguous(),
+        core_first.contiguous(),
+        gate_first.contiguous(),
+        first_weight.contiguous(),
+        grad_source_logits.contiguous(),
+        grad_target_logits.contiguous(),
+        source_weight.contiguous(),
+        target_weight.contiguous(),
+        source_index.contiguous(),
+        target_index.contiguous(),
+        int(node_rows),
+    )
+    return grad_node, grad_edge
+
+
+def _p108_edge_update_alpha_target_reduce_cuda_backward_or_none(
+    grad_edge_values: Tensor,
+    edge_cache: dict[str, Any],
+    grad_source_logits: Tensor,
+    grad_target_logits: Tensor,
+    source_linear_cache: tuple[Tensor],
+    target_linear_cache: tuple[Tensor],
+    source_index: Tensor,
+    target_index: Tensor,
+    target_offsets: Tensor | None,
+    node_rows: int,
+) -> tuple[Tensor, Tensor] | None:
+    if not _p108_use_attn_line_target_reduce_bwd():
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "line_edge_silu_project_alpha_grad_scatter_backward_target_reduce_tile32"):
+        return None
+    if target_offsets is None:
+        return None
+    if not (
+        edge_cache.get("kind") == "fused_gated"
+        and edge_cache.get("two_linear") is True
+        and edge_cache.get("split_first") is True
+        and isinstance(edge_cache.get("first"), tuple)
+    ):
+        return None
+    first_cache = edge_cache["first"]
+    if len(first_cache) != 1:
+        return None
+    first_weight = first_cache[0]
+    source_weight = source_linear_cache[0]
+    target_weight = target_linear_cache[0]
+    core_first = edge_cache.get("core_first")
+    gate_first = edge_cache.get("gate_first")
+    if not (
+        isinstance(core_first, Tensor)
+        and isinstance(gate_first, Tensor)
+        and grad_edge_values.is_cuda
+        and grad_source_logits.is_cuda
+        and grad_target_logits.is_cuda
+        and source_index.is_cuda
+        and target_index.is_cuda
+        and target_offsets.is_cuda
+        and first_weight.is_cuda
+        and source_weight.is_cuda
+        and target_weight.is_cuda
+        and grad_edge_values.dtype == torch.float32
+        and grad_source_logits.dtype == torch.float32
+        and grad_target_logits.dtype == torch.float32
+        and core_first.dtype == torch.float32
+        and gate_first.dtype == torch.float32
+        and first_weight.dtype == torch.float32
+        and source_weight.dtype == torch.float32
+        and target_weight.dtype == torch.float32
+        and source_index.dtype == torch.int64
+        and target_index.dtype == torch.int64
+        and target_offsets.dtype == torch.int64
+        and target_offsets.ndim == 1
+        and target_offsets.numel() == int(node_rows) + 1
+        and grad_edge_values.ndim == 2
+        and grad_source_logits.shape == grad_target_logits.shape == grad_edge_values.shape
+        and core_first.shape == gate_first.shape == grad_edge_values.shape
+        and grad_edge_values.shape[-1] == 128
+        and first_weight.shape == (256, 384)
+        and source_weight.shape == (128, 128)
+        and target_weight.shape == (128, 128)
+    ):
+        return None
+
+    grad_core, grad_gate = _p53b_tail_backward(grad_edge_values, edge_cache["tail"])
+    grad_core_second_in = _p53b_linear_backward(grad_core, edge_cache["core_second"])
+    grad_gate_second_in = _p53b_linear_backward(grad_gate, edge_cache["gate_second"])
+    grad_node, grad_edge = matris_op.line_edge_silu_project_alpha_grad_scatter_backward_target_reduce_tile32(
+        grad_core_second_in.contiguous(),
+        grad_gate_second_in.contiguous(),
+        core_first.contiguous(),
+        gate_first.contiguous(),
+        first_weight.contiguous(),
+        grad_source_logits.contiguous(),
+        grad_target_logits.contiguous(),
+        source_weight.contiguous(),
+        target_weight.contiguous(),
+        source_index.contiguous(),
+        target_index.contiguous(),
+        target_offsets.contiguous(),
+        int(node_rows),
+    )
+    return grad_node, grad_edge
+
+
+def _p107_edge_update_alpha_attention_cuda_backward_or_none(
+    grad_edge_values: Tensor,
+    edge_cache: dict[str, Any],
+    grad_source_out: Tensor,
+    grad_target_out: Tensor,
+    attn_cache: dict[str, Any],
+    source_linear_cache: tuple[Tensor],
+    target_linear_cache: tuple[Tensor],
+    source_index: Tensor,
+    target_index: Tensor,
+    node_rows: int,
+) -> tuple[Tensor, Tensor] | None:
+    if not _p107_use_attention_alpha_project_fused():
+        return None
+    matris_op = _load_matris_op()
+    if matris_op is None or not hasattr(matris_op, "line_edge_silu_project_alpha_attention_grad_scatter_backward_tile32"):
+        return None
+    if not (
+        edge_cache.get("kind") == "fused_gated"
+        and edge_cache.get("two_linear") is True
+        and edge_cache.get("split_first") is True
+        and isinstance(edge_cache.get("first"), tuple)
+    ):
+        return None
+    first_cache = edge_cache["first"]
+    if len(first_cache) != 1:
+        return None
+    first_weight = first_cache[0]
+    source_weight = source_linear_cache[0]
+    target_weight = target_linear_cache[0]
+    core_first = edge_cache.get("core_first")
+    gate_first = edge_cache.get("gate_first")
+    values = attn_cache["values"]
+    source_out = attn_cache["source_out"]
+    target_out = attn_cache["target_out"]
+    source_alpha = attn_cache["source_alpha"]
+    target_alpha = attn_cache["target_alpha"]
+    if not (
+        isinstance(core_first, Tensor)
+        and isinstance(gate_first, Tensor)
+        and grad_edge_values.is_cuda
+        and grad_source_out.is_cuda
+        and grad_target_out.is_cuda
+        and values.is_cuda
+        and source_out.is_cuda
+        and target_out.is_cuda
+        and source_alpha.is_cuda
+        and target_alpha.is_cuda
+        and source_index.is_cuda
+        and target_index.is_cuda
+        and first_weight.is_cuda
+        and source_weight.is_cuda
+        and target_weight.is_cuda
+        and grad_edge_values.dtype == torch.float32
+        and grad_source_out.dtype == torch.float32
+        and grad_target_out.dtype == torch.float32
+        and values.dtype == torch.float32
+        and source_out.dtype == torch.float32
+        and target_out.dtype == torch.float32
+        and source_alpha.dtype == torch.float32
+        and target_alpha.dtype == torch.float32
+        and core_first.dtype == torch.float32
+        and gate_first.dtype == torch.float32
+        and first_weight.dtype == torch.float32
+        and source_weight.dtype == torch.float32
+        and target_weight.dtype == torch.float32
+        and grad_edge_values.ndim == 2
+        and core_first.shape == gate_first.shape == values.shape == source_alpha.shape == target_alpha.shape
+        and grad_edge_values.shape == values.shape
+        and grad_source_out.shape == grad_target_out.shape == source_out.shape == target_out.shape
+        and grad_edge_values.shape[-1] == 128
+        and first_weight.shape == (256, 384)
+        and source_weight.shape == (128, 128)
+        and target_weight.shape == (128, 128)
+    ):
+        return None
+
+    grad_core, grad_gate = _p53b_tail_backward(grad_edge_values, edge_cache["tail"])
+    grad_core_second_in = _p53b_linear_backward(grad_core, edge_cache["core_second"])
+    grad_gate_second_in = _p53b_linear_backward(grad_gate, edge_cache["gate_second"])
+    grad_node, grad_edge = matris_op.line_edge_silu_project_alpha_attention_grad_scatter_backward_tile32(
+        grad_core_second_in.contiguous(),
+        grad_gate_second_in.contiguous(),
+        core_first.contiguous(),
+        gate_first.contiguous(),
+        first_weight.contiguous(),
+        grad_source_out.contiguous(),
+        grad_target_out.contiguous(),
+        values.contiguous(),
+        source_out.contiguous(),
+        target_out.contiguous(),
+        source_alpha.contiguous(),
+        target_alpha.contiguous(),
+        source_weight.contiguous(),
+        target_weight.contiguous(),
+        source_index.contiguous(),
+        target_index.contiguous(),
+        int(node_rows),
+    )
+    return grad_node, grad_edge
+
+
 def _p101_attention_layer_forward(
     layer: nn.Module,
     node_feat: Tensor,
@@ -1110,6 +2018,7 @@ def _p101_attention_layer_forward(
     return node_out, edge_out, {
         "source_index": source_index,
         "target_index": target_index,
+        "target_segment_offsets": graph.get("target_segment_offsets"),
         "edge_rows": int(edge_feat.shape[0]),
         "node_rows": int(node_feat.shape[0]),
         "gather": gather_cache,
@@ -1128,23 +2037,147 @@ def _p101_attention_layer_backward(
     grad_edge_out: Tensor,
     cache: dict[str, Any],
 ) -> tuple[Tensor, Tensor]:
-    grad_node = grad_node_out.float() * cache["node_res"]
+    if cache["node_cache"].get("kind") == "p116_fused_gated_residual":
+        node_bwd = _p116_gated_second_tail_residual_backward_or_none(
+            grad_node_out.float(),
+            cache["node_cache"],
+        )
+    else:
+        node_bwd = None
+    if node_bwd is None:
+        grad_node = grad_node_out.float() * cache["node_res"]
+        grad_node_x = _p53b_apply_update_backward(grad_node_out, cache["node_cache"])
+    else:
+        grad_node_x, grad_node = node_bwd
     grad_edge = grad_edge_out.float() * cache["edge_res"]
 
-    grad_node_x = _p53b_apply_update_backward(grad_node_out, cache["node_cache"])
-    grad_node_direct, grad_source_logits, grad_target_logits, grad_edge_values = _p101_attention_node_input_backward(
+    p107_node_input = _p107_attention_node_input_values_backward_or_none(
         grad_node_x,
         cache["attn"],
+        grad_edge_out.float(),
     )
+    if p107_node_input is None:
+        fused_node_input = _p106_attention_node_input_backward_edge_direct_or_none(
+            grad_node_x,
+            cache["attn"],
+            grad_edge_out.float(),
+        )
+        if fused_node_input is None:
+            grad_node_direct, grad_source_logits, grad_target_logits, grad_edge_values = _p101_attention_node_input_backward(
+                grad_node_x,
+                cache["attn"],
+            )
+            grad_edge_values = grad_edge_values + grad_edge_out.float()
+        else:
+            grad_node_direct, grad_source_logits, grad_target_logits, grad_edge_values = fused_node_input
+        p107_source_out_grad = None
+        p107_target_out_grad = None
+        p107_attn_cache = None
+    else:
+        (
+            grad_node_direct,
+            p107_source_out_grad,
+            p107_target_out_grad,
+            grad_edge_values,
+            p107_attn_cache,
+        ) = p107_node_input
+        grad_source_logits = None
+        grad_target_logits = None
     grad_node = grad_node + grad_node_direct
-    grad_edge_values = grad_edge_values + grad_edge_out.float()
 
-    grad_edge_feat = _p53b_linear_backward(grad_source_logits, cache["source_linear"])
-    grad_edge_feat = grad_edge_feat + _p53b_linear_backward(grad_target_logits, cache["target_linear"])
-    grad_edge_x = _p53b_apply_update_backward(grad_edge_values, cache["edge_cache"])
-    grad_node_from_gather, grad_edge_from_gather = _p101_line_gather_cat_backward(grad_edge_x, cache["gather"])
-    grad_node = grad_node + grad_node_from_gather
-    grad_edge = grad_edge + grad_edge_feat + grad_edge_from_gather
+    fused_edge_alpha = None
+    if p107_attn_cache is not None and p107_source_out_grad is not None and p107_target_out_grad is not None:
+        fused_edge_alpha = _p107_edge_update_alpha_attention_cuda_backward_or_none(
+            grad_edge_values,
+            cache["edge_cache"],
+            p107_source_out_grad,
+            p107_target_out_grad,
+            p107_attn_cache,
+            cache["source_linear"],
+            cache["target_linear"],
+            cache["source_index"],
+            cache["target_index"],
+            cache["node_rows"],
+        )
+    if fused_edge_alpha is None and grad_source_logits is not None and grad_target_logits is not None:
+        fused_edge_alpha = _p108_edge_update_alpha_dense_gemm_op_backward_or_none(
+            grad_edge_values,
+            cache["edge_cache"],
+            grad_source_logits,
+            grad_target_logits,
+            cache["source_linear"],
+            cache["target_linear"],
+            cache["source_index"],
+            cache["target_index"],
+            cache["node_rows"],
+        )
+    if fused_edge_alpha is None and grad_source_logits is not None and grad_target_logits is not None:
+        fused_edge_alpha = _p108_edge_update_alpha_dense_gemm_scatter_backward_or_none(
+            grad_edge_values,
+            cache["edge_cache"],
+            grad_source_logits,
+            grad_target_logits,
+            cache["source_linear"],
+            cache["target_linear"],
+            cache["source_index"],
+            cache["target_index"],
+            cache["node_rows"],
+        )
+    if fused_edge_alpha is None and grad_source_logits is not None and grad_target_logits is not None:
+        fused_edge_alpha = _p108_edge_update_alpha_tiled_cuda_backward_or_none(
+            grad_edge_values,
+            cache["edge_cache"],
+            grad_source_logits,
+            grad_target_logits,
+            cache["source_linear"],
+            cache["target_linear"],
+            cache["source_index"],
+            cache["target_index"],
+            cache["node_rows"],
+        )
+    if fused_edge_alpha is None and grad_source_logits is not None and grad_target_logits is not None:
+        fused_edge_alpha = _p108_edge_update_alpha_target_reduce_cuda_backward_or_none(
+            grad_edge_values,
+            cache["edge_cache"],
+            grad_source_logits,
+            grad_target_logits,
+            cache["source_linear"],
+            cache["target_linear"],
+            cache["source_index"],
+            cache["target_index"],
+            cache.get("target_segment_offsets"),
+            cache["node_rows"],
+        )
+    if fused_edge_alpha is None and grad_source_logits is not None and grad_target_logits is not None:
+        fused_edge_alpha = _p105_edge_update_alpha_cuda_backward_or_none(
+            grad_edge_values,
+            cache["edge_cache"],
+            grad_source_logits,
+            grad_target_logits,
+            cache["source_linear"],
+            cache["target_linear"],
+            cache["source_index"],
+            cache["target_index"],
+            cache["node_rows"],
+        )
+    if fused_edge_alpha is None:
+        if grad_source_logits is None or grad_target_logits is None:
+            grad_source_logits, grad_target_logits, grad_edge_values_without_direct = _p53b_attention_backward(
+                p107_source_out_grad,
+                p107_target_out_grad,
+                p107_attn_cache,
+            )
+            grad_edge_values = grad_edge_values_without_direct + grad_edge_out.float()
+        grad_edge_feat = _p53b_linear_backward(grad_source_logits, cache["source_linear"])
+        grad_edge_feat = grad_edge_feat + _p53b_linear_backward(grad_target_logits, cache["target_linear"])
+        grad_edge_x = _p53b_apply_update_backward(grad_edge_values, cache["edge_cache"])
+        grad_node_from_gather, grad_edge_from_gather = _p101_line_gather_cat_backward(grad_edge_x, cache["gather"])
+        grad_node = grad_node + grad_node_from_gather
+        grad_edge = grad_edge + grad_edge_feat + grad_edge_from_gather
+    else:
+        grad_node_from_fused, grad_edge_from_fused = fused_edge_alpha
+        grad_node = grad_node + grad_node_from_fused
+        grad_edge = grad_edge + grad_edge_from_fused
     return grad_node, grad_edge
 
 
@@ -1261,6 +2294,7 @@ def _p53b_refinement_forward(
         smooth_cache_extra = {
             "kind": "line",
             "linear": smooth_cache,
+            "base_envelope": base_envelope,
             "base_i": base_i,
             "base_j": base_j,
             "atom_index": atom_index,
@@ -1302,6 +2336,7 @@ def _p53b_refinement_forward(
         "use_smoothed_for_delta_edge": bool(layer.use_smoothed_for_delta_edge),
         "node_res": layer.node_res_weight.float(),
         "edge_res": layer.edge_res_weight.float(),
+        "profile_prefix": getattr(layer, "profile_prefix", ""),
     }
 
 
@@ -1555,6 +2590,47 @@ class _P58RefineLineSmoothReduce(torch.autograd.Function):
             target_index,
         )
         return grad_nonlinear, grad_base, None, None, None
+
+
+class _P58RefineLineSmoothReduceSorted(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        nonlinear: Tensor,
+        base_envelope: Tensor,
+        source_index: Tensor,
+        target_offsets: Tensor,
+    ) -> Tensor:
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "refine_line_smooth_reduce_sorted_forward"):
+            raise RuntimeError("matris_op.refine_line_smooth_reduce_sorted_forward is unavailable")
+        source_index = source_index.contiguous()
+        target_offsets = target_offsets.contiguous()
+        nonlinear = nonlinear.contiguous()
+        base_envelope = base_envelope.contiguous()
+        out = matris_op.refine_line_smooth_reduce_sorted_forward(
+            nonlinear,
+            base_envelope,
+            source_index,
+            target_offsets,
+        )
+        ctx.save_for_backward(nonlinear, base_envelope, source_index, target_offsets)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        nonlinear, base_envelope, source_index, target_offsets = ctx.saved_tensors
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "refine_line_smooth_reduce_sorted_backward"):
+            raise RuntimeError("matris_op.refine_line_smooth_reduce_sorted_backward is unavailable")
+        grad_nonlinear, grad_base = matris_op.refine_line_smooth_reduce_sorted_backward(
+            grad_out.contiguous(),
+            nonlinear,
+            base_envelope,
+            source_index,
+            target_offsets,
+        )
+        return grad_nonlinear, grad_base, None, None
 
 
 class _P102RefineLineFFNPairManualVJP(torch.autograd.Function):
@@ -1843,6 +2919,26 @@ class Graph_Attention_Layer(nn.Module):
                     result = fn()
             return result
 
+        def fused_node_update_residual_or_none(fusion_node_feat: Tensor) -> Tensor | None:
+            if os.environ.get("MATRIS_P116_GATED_TAIL_SECOND_RESIDUAL_MACRO", "0") != "1":
+                return None
+            if not hasattr(self.node_nonlinear_update, "forward_with_residual_after_first_projection"):
+                return None
+            return self.node_nonlinear_update.forward_with_residual_after_first_projection(
+                fusion_node_feat,
+                node_feat,
+                self.node_res_weight,
+            )
+
+        def node_update_residual_or_none(fusion_node_feat: Tensor) -> Tensor | None:
+            if os.environ.get("MATRIS_P116_GATED_TAIL_SECOND_RESIDUAL_MACRO", "0") != "1":
+                return None
+            return timed_detail(
+                "node_update_residual_fused",
+                (fusion_node_feat, node_feat),
+                lambda: fused_node_update_residual_or_none(fusion_node_feat),
+            )
+
         broad_aggressive_mode = aggressive_broad_bwd_mode()
         aggressive_mode = (
             aggressive_line_attn_eval_mode()
@@ -1873,16 +2969,20 @@ class Graph_Attention_Layer(nn.Module):
                 (node_feat, attn_target_feat, attn_source_feat),
                 lambda: torch.cat([node_feat, attn_target_feat, attn_source_feat], dim=1),
             )
-            attn_node_feat = timed_detail(
-                "node_update",
-                (fusion_node_feat,),
-                lambda: self.node_nonlinear_update(fusion_node_feat),
-            )
-            attn_node_feat = timed_detail(
-                "residual",
-                (attn_node_feat, node_feat, attn_edge_feat, edge_feat),
-                lambda: attn_node_feat + self.node_res_weight * node_feat,
-            )
+            fused_node_residual = node_update_residual_or_none(fusion_node_feat)
+            if fused_node_residual is None:
+                attn_node_feat = timed_detail(
+                    "node_update",
+                    (fusion_node_feat,),
+                    lambda: self.node_nonlinear_update(fusion_node_feat),
+                )
+                attn_node_feat = timed_detail(
+                    "residual",
+                    (attn_node_feat, node_feat, attn_edge_feat, edge_feat),
+                    lambda: attn_node_feat + self.node_res_weight * node_feat,
+                )
+            else:
+                attn_node_feat = fused_node_residual
             attn_edge_feat = attn_edge_feat + self.edge_res_weight * edge_feat
             return attn_node_feat, attn_edge_feat
         if (
@@ -2024,23 +3124,33 @@ class Graph_Attention_Layer(nn.Module):
                 ),
             )
         if fusion_node_feat is not None:
-            attn_node_feat = timed_detail(
-                "node_update",
-                (fusion_node_feat,),
-                lambda: self.node_nonlinear_update(fusion_node_feat),
-            )
+            fused_node_residual = node_update_residual_or_none(fusion_node_feat)
 
-            def residual_update():
-                return (
-                    attn_node_feat + self.node_res_weight * node_feat,
-                    attn_edge_feat + self.edge_res_weight * edge_feat,
+            if fused_node_residual is None:
+                attn_node_feat = timed_detail(
+                    "node_update",
+                    (fusion_node_feat,),
+                    lambda: self.node_nonlinear_update(fusion_node_feat),
                 )
 
-            attn_node_feat, attn_edge_feat = timed_detail(
-                "residual",
-                (attn_node_feat, node_feat, attn_edge_feat, edge_feat),
-                residual_update,
-            )
+                def residual_update():
+                    return (
+                        attn_node_feat + self.node_res_weight * node_feat,
+                        attn_edge_feat + self.edge_res_weight * edge_feat,
+                    )
+
+                attn_node_feat, attn_edge_feat = timed_detail(
+                    "residual",
+                    (attn_node_feat, node_feat, attn_edge_feat, edge_feat),
+                    residual_update,
+                )
+            else:
+                attn_node_feat = fused_node_residual
+                attn_edge_feat = timed_detail(
+                    "residual",
+                    (attn_node_feat, node_feat, attn_edge_feat, edge_feat),
+                    lambda: attn_edge_feat + self.edge_res_weight * edge_feat,
+                )
             return attn_node_feat, attn_edge_feat
         
         # Softmax
@@ -2198,24 +3308,33 @@ class Graph_Attention_Layer(nn.Module):
             (node_feat, attn_target_feat, attn_source_feat),
             node_update_input_concat,
         )
-        attn_node_feat = timed_detail(
-            "node_update",
-            (fusion_node_feat,),
-            lambda: self.node_nonlinear_update(fusion_node_feat),
-        )
-        
-        # Resdual
-        def residual_update():
-            return (
-                attn_node_feat + self.node_res_weight * node_feat,
-                attn_edge_feat + self.edge_res_weight * edge_feat,
+        fused_node_residual = node_update_residual_or_none(fusion_node_feat)
+        if fused_node_residual is None:
+            attn_node_feat = timed_detail(
+                "node_update",
+                (fusion_node_feat,),
+                lambda: self.node_nonlinear_update(fusion_node_feat),
             )
 
-        attn_node_feat, attn_edge_feat = timed_detail(
-            "residual",
-            (attn_node_feat, node_feat, attn_edge_feat, edge_feat),
-            residual_update,
-        )
+            # Resdual
+            def residual_update():
+                return (
+                    attn_node_feat + self.node_res_weight * node_feat,
+                    attn_edge_feat + self.edge_res_weight * edge_feat,
+                )
+
+            attn_node_feat, attn_edge_feat = timed_detail(
+                "residual",
+                (attn_node_feat, node_feat, attn_edge_feat, edge_feat),
+                residual_update,
+            )
+        else:
+            attn_node_feat = fused_node_residual
+            attn_edge_feat = timed_detail(
+                "residual",
+                (attn_node_feat, node_feat, attn_edge_feat, edge_feat),
+                lambda: attn_edge_feat + self.edge_res_weight * edge_feat,
+            )
 
         return attn_node_feat, attn_edge_feat
 
@@ -2305,6 +3424,7 @@ class Refinement(nn.Module):
         # when graph=="line graph", make sure atom_deat is not None.
         is_atom_graph = (self.graph_type == "atom graph")
         profile_prefix = getattr(self, "profile_prefix", self.__class__.__name__)
+
         if (
             not is_atom_graph
             and _use_p104_refine_line_r3_block_vjp(profile_prefix)
@@ -2336,8 +3456,18 @@ class Refinement(nn.Module):
                 atom_feat,
             )
         
-        if is_atom_graph: 
+        p110_refine_atom_edge_update = (
+            is_atom_graph
+            and (
+                os.environ.get("MATRIS_P110_REFINE_ATOM_EDGE_UPDATE", "0") == "1"
+                or os.environ.get("MATRIS_P111_REFINE_ATOM_FUSED_FIRST", "0") == "1"
+            )
+            and hasattr(self.edge_nonlinear_update, "forward_refine_atom_edge")
+        )
+        if is_atom_graph and not p110_refine_atom_edge_update:
             edge_feat_0 = torch.index_select(edge_feat, 0, directed2undirected) 
+        elif is_atom_graph:
+            edge_feat_0 = None
         else:
             edge_feat_0 = edge_feat
 
@@ -2347,12 +3477,15 @@ class Refinement(nn.Module):
         delta_edge_feat_precomputed = None
         # Envelope 
         if is_atom_graph:
-            source_node_feat = torch.index_select(node_feat, 0, graph['source_index'])
-            target_node_feat = torch.index_select(node_feat, 0, graph['target_index'])
             smooth_weight = torch.index_select(smooth_weight, 0, directed2undirected)
             smooth_weight = self.learnable_envelope(smooth_weight)
             # Fusion feature
-            refine_fusion_feat = torch.cat([edge_feat_0, target_node_feat, source_node_feat], dim=1) 
+            if not p110_refine_atom_edge_update:
+                source_node_feat = torch.index_select(node_feat, 0, graph['source_index'])
+                target_node_feat = torch.index_select(node_feat, 0, graph['target_index'])
+                refine_fusion_feat = torch.cat([edge_feat_0, target_node_feat, source_node_feat], dim=1)
+            else:
+                refine_fusion_feat = None
         else:
             base_envelope = self.learnable_envelope(smooth_weight)
             p58_smooth_reduce = (
@@ -2422,17 +3555,31 @@ class Refinement(nn.Module):
             elif p103_edge_update_edge_ffn:
                 refine_fusion_feat_nonlinear, delta_edge_feat_precomputed = (
                     _P103RefineLineEdgeUpdateEdgeFFNManualVJP.apply(
-                        self,
-                        graph,
-                        node_feat,
-                        edge_feat_0,
-                        atom_feat,
-                    )
+                    self,
+                    graph,
+                    node_feat,
+                    edge_feat_0,
+                    atom_feat,
                 )
-            if not p63_edge_smooth_used and not p58_smooth_reduce:
-                base_weights_i = torch.index_select(base_envelope, 0, graph['source_index'])
-                base_weights_j = torch.index_select(base_envelope, 0, graph['target_index'])
-                smooth_weight = base_weights_i * base_weights_j
+                )
+            p58_smooth_reduce_sorted = (
+                _use_p58_refine_line_smooth_reduce_sorted(profile_prefix)
+                and self.training is False
+                and torch.is_grad_enabled()
+                and base_envelope.is_cuda
+                and base_envelope.dtype == torch.float32
+                and base_envelope.ndim == 2
+                and base_envelope.shape[-1] == 128
+                and smooth_weight.is_cuda
+                and _refine_line_target_index_is_sorted(graph)
+            )
+            if not p63_edge_smooth_used and not p58_smooth_reduce and not p58_smooth_reduce_sorted:
+                def gather_smooth_weights():
+                    base_weights_i = torch.index_select(base_envelope, 0, graph['source_index'])
+                    base_weights_j = torch.index_select(base_envelope, 0, graph['target_index'])
+                    return base_weights_i * base_weights_j
+
+                smooth_weight = gather_smooth_weights()
             # Fusion feature
             refine_fusion_feat = None
             if p63_edge_smooth_used:
@@ -2465,17 +3612,31 @@ class Refinement(nn.Module):
             else:
                 refine_fusion_feat_nonlinear = None
             if not p63_edge_smooth_used and refine_fusion_feat_nonlinear is None:
-                source_node_feat = torch.index_select(node_feat, 0, graph['source_index'])
-                target_node_feat = torch.index_select(node_feat, 0, graph['target_index'])
-                three_body_atom_feat = torch.index_select(atom_feat, 0, graph['atom_list'])
-                refine_fusion_feat = torch.cat([edge_feat_0, three_body_atom_feat, target_node_feat, source_node_feat], dim=1) 
+                def gather_concat_refine_line():
+                    source_node_feat = torch.index_select(node_feat, 0, graph['source_index'])
+                    target_node_feat = torch.index_select(node_feat, 0, graph['target_index'])
+                    three_body_atom_feat = torch.index_select(atom_feat, 0, graph['atom_list'])
+                    return torch.cat([edge_feat_0, three_body_atom_feat, target_node_feat, source_node_feat], dim=1)
+
+                refine_fusion_feat = gather_concat_refine_line()
         
         # Nonlinear            
         if not is_atom_graph and 'p63_edge_smooth_used' in locals() and p63_edge_smooth_used:
             pass
         else:
             if refine_fusion_feat_nonlinear is None:
-                refine_fusion_feat_nonlinear = self.edge_nonlinear_update(refine_fusion_feat)
+                if (
+                    p110_refine_atom_edge_update
+                ):
+                    refine_fusion_feat_nonlinear = self.edge_nonlinear_update.forward_refine_atom_edge(
+                        node_feat,
+                        edge_feat,
+                        directed2undirected,
+                        graph['source_index'],
+                        graph['target_index'],
+                    )
+                if refine_fusion_feat_nonlinear is None:
+                    refine_fusion_feat_nonlinear = self.edge_nonlinear_update(refine_fusion_feat)
             if not is_atom_graph and 'p58_smooth_reduce' in locals() and p58_smooth_reduce:
                 refine_fusion_feat_smooth = None
                 refine_node_feas = _P58RefineLineSmoothReduce.apply(
@@ -2485,16 +3646,26 @@ class Refinement(nn.Module):
                     graph['target_index'],
                     len(node_feat),
                 )
+            elif not is_atom_graph and 'p58_smooth_reduce_sorted' in locals() and p58_smooth_reduce_sorted:
+                refine_fusion_feat_smooth = None
+                refine_node_feas = _P58RefineLineSmoothReduceSorted.apply(
+                    refine_fusion_feat_nonlinear,
+                    base_envelope,
+                    graph['source_index'],
+                    graph['target_segment_offsets'],
+                )
             else:
                 refine_fusion_feat_smooth = refine_fusion_feat_nonlinear * smooth_weight
              
                 profile_prefix = getattr(self, "profile_prefix", self.__class__.__name__)
-                refine_node_feas = aggregate(refine_fusion_feat_smooth,
-                                             graph['target_index'],
-                                             graph['target_bincount'],
-                                             average=False,
-                                             num_segment=len(node_feat),
-                                             profile_name=f"{profile_prefix}.target_smooth_sum")
+                refine_node_feas = aggregate(
+                    refine_fusion_feat_smooth,
+                    graph['target_index'],
+                    graph['target_bincount'],
+                    average=False,
+                    num_segment=len(node_feat),
+                    profile_name=f"{profile_prefix}.target_smooth_sum",
+                )
 
         input2edgeFFN = (
             refine_fusion_feat_smooth
@@ -2503,6 +3674,7 @@ class Refinement(nn.Module):
         )
         
         profile_prefix = getattr(self, "profile_prefix", self.__class__.__name__)
+
         if delta_edge_feat_precomputed is not None:
             delta_node_feat = self.node_FFN(refine_node_feas)
             delta_edge_feat = delta_edge_feat_precomputed
@@ -2558,8 +3730,13 @@ class Refinement(nn.Module):
             else:
                 delta_edge_feat = directed_average
 
-        update_node_feat = delta_node_feat + self.node_res_weight * node_feat
-        update_edge_feat = delta_edge_feat + self.edge_res_weight * edge_feat
+        def residual_update():
+            return (
+                delta_node_feat + self.node_res_weight * node_feat,
+                delta_edge_feat + self.edge_res_weight * edge_feat,
+            )
+
+        update_node_feat, update_edge_feat = residual_update()
         
         return update_node_feat, update_edge_feat
 

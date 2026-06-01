@@ -1,189 +1,175 @@
-MatRIS sAlex Fuse 优化任务清单
+MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 
-更新时间：2026-05-24
+更新时间：2026-06-01
 
-本文件现在只维护 MatRIS sAlex 的纯 fuse / CUDA glue 优化主线。
+本清单只维护 MatRIS sAlex teacher `efsm` 路径的有效优化主线。旧量化路线、失败分支和重复过程日志已精简；详细原始记录可查 `MatRIS_compile任务清单.txt` 和 `results/`。
 
-从本次更新开始，后续不再继续做量化优化；W8A8/W4A8、fake quant、torchao、scaled epilogue 等内容只作为历史归档和 no-go 参考。新的优化工作只围绕 FP32 teacher 路径上的 fuse、module macro、layout / autograd glue、CUDA kernel 边界展开。
+核心原则
 
-一、当前结论
+1. 最终结论只认端到端：
+   `test/eval/infer_salex_lmdb_quant.py --measure-time`
+2. `torch.compile` 主要作为“发现可融合边界”的工具，不直接作为当前最佳 endpoint。
+3. 如果 compile 发现有效边界，优先判断是否值得写成 CUDA/C++/cuBLASLt/CUTLASS macro。
+4. 每个候选必须记录：
+   `latency_ms_mean`、`latency_s_total` 或 `latency_ms_total`、`throughput_structures_per_s`、`energy_mae_natoms`、`force_mae`、`stress_mae`、成功/跳过样本。
 
-1. 当前主线：纯 FP32 fuse 优化
-   - 当前可复刻的纯 fuse 版本是 `p71_latency_pruned_fusion_only` + `p28_p26_all_ffn_mlp_input_grad_only`。
-   - 这个版本不替换 Linear，不使用量化收益；`quant_replaced_modules=0`。
-   - 它通过 GatedMLP / MLP fuse 和 env-gated CUDA 优化加速 teacher `efsm` 路径。
-   - 当前实测替换规模：`60` 个 GatedMLP + `40` 个 MLP，共 `100` 个 fused modules。
-   - 当前最优候选默认不再带两个历史 W8A8 残留 env：`MATRIS_W8A8_BACKEND`、`MATRIS_W8A8_DISABLE_FAST_WRAPPER`。
+当前最佳候选
 
-2. 本次第一步参考结果：limit500 / seed42 / teacher `efsm`
-   - 路径：`test/eval/infer_salex_lmdb_quant.py --measure-time`
-   - 数据集：`/home/lht/lab/sAlex/val`
-   - 模型：`matris_10m_oam`
-   - 设备：A800，单卡运行，不同 run 分别使用独立 GPU。
-   - 结果文件：
-     - baseline：`results/fp32_baseline_replay_20260524/eval/summary.json`
-     - pure fuse run1：`results/fp32_fused_p71_replay_20260524/eval/summary.json`
-     - pure fuse run2：`results/fp32_fused_p71_replay_20260524_run2/eval/summary.json`
+当前最佳：P115 all node + atom edge GatedMLP second-tail CUDA macro + line graph GC guard。
 
-| version | quant_mode | fusion_mode | success | latency_ms_mean | structures/s | speedup vs baseline | latency reduction |
-|---|---|---|---:|---:|---:|---:|---:|
-| FP32 baseline | `none` | `none` | 500/500 | `134.746964` | `7.421317` | `1.000000x` | `0.000000%` |
-| pure fuse run1 | `p71_latency_pruned_fusion_only` | `p28_p26_all_ffn_mlp_input_grad_only` | 500/500 | `87.571330` | `11.419262` | `1.538711x` | `35.010536%` |
-| pure fuse run2 | `p71_latency_pruned_fusion_only` | `p28_p26_all_ffn_mlp_input_grad_only` | 500/500 | `87.967002` | `11.367899` | `1.531790x` | `34.716895%` |
-| pure fuse avg | same | same | 2 runs | `87.769166` | - | `1.535243x` | `34.863715%` |
+核心结论：
 
-说明：上表 pure fuse run1/run2 是历史 p71 env 复刻口径，包含 `MATRIS_W8A8_BACKEND` 和 `MATRIS_W8A8_DISABLE_FAST_WRAPPER`。消融后这两个 env 已从最优候选中移除。
+- limit500：`70.504408 ms`
+- limit5000：`70.541407 ms`
+- 相对历史正式 FP32 baseline 5000：约 `1.858x`
+- 相对 P108 attn_line dense-GEMM 旧最佳：约 `1.191x`
+- 相对 P113 second-tail 初版：约 `1.149x`
+- 相对旧 P115 5000：约 `1.041x`
 
-3. 本次 500 样本消融结果：GatedMLP / MLP 分组 + 其它优化分点
-   - 消融脚本：`test/eval/run_pure_fuse_ablation.py`
-   - 汇总文件：`results/pure_fuse_ablation_500_20260524_summary.md`
-   - 口径：limit500 / seed42 / teacher `efsm` / `CUDA_VISIBLE_DEVICES=4`
-   - 判断方式：`delta_vs_full_ms > 0` 表示去掉该点后更慢，该优化点是正收益；`delta_vs_full_ms < 0` 表示去掉该点后更快，该优化点可能是负优化或噪声。
+当前最佳优化栈：
 
-| idx | ablation | category | success | latency_ms_mean | structures/s | delta vs full |
-|---:|---|---|---:|---:|---:|---:|
-| 0 | FP32 baseline none/none | anchor | 500/500 | `131.939544` | `7.579229` | `45.118413` |
-| 1 | full pure fuse | anchor | 500/500 | `86.821131` | `11.517933` | `0.000000` |
-| 2 | full pure fuse without W8A8 residual env | env_sanity | 500/500 | `86.502492` | `11.560361` | `-0.318639` |
-| 3 | no P26 GatedMLP tail input-grad | env_leave_one_out | 500/500 | `97.066585` | `10.302207` | `10.245454` |
-| 4 | no P28 MLP input-grad | env_leave_one_out | 500/500 | `93.001113` | `10.752560` | `6.179982` |
-| 5 | no P29 MLP backward kernel | env_leave_one_out | 500/500 | `88.002307` | `11.363339` | `1.181176` |
-| 6 | no CUDA fused line attention | env_leave_one_out | 500/500 | `100.095231` | `9.990486` | `13.274100` |
-| 7 | no CUDA fused atom attention | env_leave_one_out | 500/500 | `99.494870` | `10.050769` | `12.673739` |
-| 8 | no CUDA directed2undirected average | env_leave_one_out | 500/500 | `93.192139` | `10.730519` | `6.371008` |
-| 9 | no module fusion but full env | fusion_total | 500/500 | `100.944987` | `9.906386` | `14.123856` |
-| 10 | no GatedMLP group attn_atom_node | gated_mlp_leave_one_out | 500/500 | `88.336302` | `11.320374` | `1.515171` |
-| 11 | no GatedMLP group attn_atom_edge | gated_mlp_leave_one_out | 500/500 | `88.666501` | `11.278217` | `1.845370` |
-| 12 | no GatedMLP group attn_line_node | gated_mlp_leave_one_out | 500/500 | `89.066574` | `11.227557` | `2.245443` |
-| 13 | no GatedMLP group attn_line_edge | gated_mlp_leave_one_out | 500/500 | `88.347754` | `11.318907` | `1.526623` |
-| 14 | no GatedMLP group refine_atom_edge | gated_mlp_leave_one_out | 500/500 | `89.558312` | `11.165909` | `2.737181` |
-| 15 | no GatedMLP group refine_line_edge | gated_mlp_leave_one_out | 500/500 | `90.130913` | `11.094972` | `3.309783` |
-| 16 | no MLP group refine_line_node_ffn | mlp_leave_one_out | 500/500 | `88.144585` | `11.344996` | `1.323454` |
-| 17 | no MLP group refine_line_edge_ffn | mlp_leave_one_out | 500/500 | `88.447309` | `11.306167` | `1.626178` |
-| 18 | no MLP group refine_atom_node_ffn | mlp_leave_one_out | 500/500 | `87.661008` | `11.407580` | `0.839878` |
-| 19 | no MLP group refine_atom_edge_ffn | mlp_leave_one_out | 500/500 | `87.927748` | `11.372974` | `1.106617` |
-
-4. 目前纯 fuse 的最好优化结果
-   - 当前稳定锚点：`pure_fuse_no_w8a8_residual_env`。
-   - 稳定锚点显式总耗时复测结果：`85.187982 ms`，对应 `11.738745 structures/s`，500 个成功样本的测量段总耗时为 `42.593991 s`。
-   - 新 A3 候选：`pure_fuse_no_w8a8_residual_env + MATRIS_P99B_ATTN_LINE_MODULE_VJP=1`，并默认不启用 `MATRIS_P99B_RECORD_FUNCTION`。
-   - 新 A3 候选 limit500 run1：`83.972188 ms`，total `41.986094 s`；run2：`85.165571 ms`，total `42.582785 s`；2-run avg `84.568879 ms`。
-   - 新 A3 候选 limit5000 复核：`4999/5000` 成功，`85.193363 ms`，total `425.881620 s`，`11.738004 structures/s`。
-   - limit5000 中跳过 `graph_id=219803`，原因是 `Detected 2 isolated atom`；脚本已捕获并跳过该样本，因此计时统计为 `4999` 个成功样本。
-   - 新 A3 候选 limit5000 相对同次 FP32 baseline `133.608348 ms` 的参考加速比为 `1.568295x`；相对稳定锚点 `85.187982 ms` 慢 `0.005381 ms`，可以视为持平。
-   - 因此目前纯 fuse 的最好优化结果仍保守记为稳定锚点 `85.187982 ms`；新 A3 候选结论为“数值正确，但 5000 样本收益不稳定/基本持平”，暂不替代稳定锚点。
-   - A3-lite P101 no-node-input 候选：`MATRIS_P101_A3_LITE_ATTN_LINE_VJP=1` + `MATRIS_P101_USE_NODE_INPUT_ATTENTION=0`。
-   - P101 no-node-input limit500 run1：`85.033367 ms`，run2：`84.385293 ms`，2-run avg `84.709330 ms`。
-   - P101 no-node-input limit5000 复核：`4999/5000` 成功，`85.018572 ms`，total `425.007841 s`，`11.762136 structures/s`。
-   - P101 no-node-input 相对稳定锚点快 `0.169410 ms`，相对 P99B fixed no-record limit5000 快 `0.174791 ms`；收益很小但 500/5000 都为正，暂记为新的轻量候选，建议再跑一次 limit5000 后再替代稳定锚点。
-   - 该候选保留 `100` 个模块 fuse，明确去掉两个历史残留 env：`MATRIS_W8A8_BACKEND` / `MATRIS_W8A8_DISABLE_FAST_WRAPPER`。
-   - 同次显式总耗时复测的 FP32 baseline：`133.608348 ms`，500 个成功样本的测量段总耗时为 `66.804174 s`。
-   - 稳定锚点按 mean 或总测量段计算，加速比均为 `1.568394x`，latency 降幅为 `36.240525%`，500 样本测量段节省 `24.210183 s`。
-   - 本次总耗时复测结果文件：
-     - baseline：`results/total_timing_compare_500_20260524/baseline/eval/summary.json`
-     - pure fuse stable anchor：`results/total_timing_compare_500_20260524/best_pure_fuse/eval/summary.json`
-     - P99B fixed no-record run1：`results/attn_line_macro_p99b_fixed_no_record_limit500_20260524/eval/summary.json`
-     - P99B fixed no-record run2：`results/attn_line_macro_p99b_fixed_no_record_limit500_20260524_run2/eval/summary.json`
-     - P99B fixed no-record limit5000：`results/attn_line_macro_p99b_fixed_no_record_limit5000_20260524/eval/summary.json`
-     - P101 A3-lite no-node-input run1：`results/attn_line_macro_p101_a3_lite_no_node_input_limit500_20260524/eval/summary.json`
-     - P101 A3-lite no-node-input run2：`results/attn_line_macro_p101_a3_lite_no_node_input_limit500_20260524_run2/eval/summary.json`
-     - P101 A3-lite no-node-input limit5000：`results/attn_line_macro_p101_a3_lite_no_node_input_limit5000_20260524/eval/summary.json`
-   - 前一轮消融单次最好 pure fuse 结果：`86.502492 ms`，对应 `11.560361 structures/s`；相对同批 FP32 baseline `131.939544 ms`，加速比为 `1.525269x`，latency 降幅为 `34.437782%`。
-   - 带 `MATRIS_W8A8_BACKEND` / `MATRIS_W8A8_DISABLE_FAST_WRAPPER` 的历史 p71 env 不再进入最优候选，只保留为复刻参考；本次该口径为 `86.821131 ms`。
-   - 本次消融确认这两个历史残留 env 去掉后快 `0.318639 ms`，后续默认剔除，并用多次重复或 limit5000 复核稳定性。
-   - 其它 GatedMLP / MLP 细分组去掉后均变慢，说明当前模块 fuse 组整体是正收益。
-   - 精度与 baseline 对齐：
-     - 同次总耗时 baseline：energy_mae_natoms `0.007654569116`，force_mae `0.021736013607`，stress_mae `0.001431524679`
-     - 稳定锚点：energy_mae_natoms `0.007654574240`，force_mae `0.021735933212`，stress_mae `0.001431522290`
-     - P99B fixed no-record run2：energy_mae_natoms `0.007654569142`，force_mae `0.021736007100`，stress_mae `0.001431524219`
-
-5. 历史 85ms 记录说明
-   - 清单旧记录中，同口径 limit500 曾记录 FP32 fused baseline：`85.377888 ms`。
-   - 另一个历史 replay 结果：`86.271564 ms`，路径为 `/home/lht/lab/MatRIS/results/salex_small_p71_replay_limit500_20260516/summary.json`。
-   - 前一轮在 `/home/lht/lab_fuse/MatRIS` 当前工作树复刻到历史 p71 env 口径 `86.821131 ms`；去掉残留 W8A8 env 后消融单次最好为 `86.502492 ms`。
-   - 最新稳定锚点显式总耗时复测已跑到 `85.187982 ms`；P99B 新 A3 候选 limit500 两次平均 `84.568879 ms`，但 limit5000 复核为 `85.193363 ms`，与稳定锚点基本持平，因此不替代稳定锚点。P101 A3-lite no-node-input limit5000 为 `85.018572 ms`，目前是新的轻量候选，但收益只有 `0.169410 ms`，需要再次 limit5000 复跑确认后再改写“最好结果”。历史 `85.377888 ms` 只作为旧记录参考。
-
-6. 历史正式 5000 结果仍可作为旧口径参考
-
-| version | success | skipped | latency_ms_mean | structures/s | speedup vs FP32 |
-|---|---:|---:|---:|---:|---:|
-| FP32 baseline | 4999/5000 | 1 | `131.042806` | `7.631094` | `1.000000x` |
-| p35a | 4999/5000 | 1 | `102.718759` | `9.735320` | `1.275744x` |
-| p71 latency-pruned pure fuse | 4999/5000 | 1 | `100.407039` | `9.959461` | `1.305116x` |
-
-二、固定评测口径
-
-1. 最终测速
-   - 只看 teacher 路径：`MatRISCalculator(task="efsm")` / ASE 调用。
-   - 当前脚本：`test/eval/infer_salex_lmdb_quant.py --measure-time`。
-   - 报告最终加速比必须使用 `latency_ms_mean`、`latency_s_total` 或 `throughput_structures_per_s`。
-   - 当前 summary 的 `timing` 已显式写入 `num_timed_samples`、`latency_ms_total`、`latency_s_total`；当两组 success 数相同，mean 耗时加速比与总测量段耗时加速比等价。
-   - 第一阶段先跑 limit500；limit500 明确赢，再跑 limit5000。
-   - 同一个对比组必须固定 dataset、limit、sample_seed、task、precision 和 GPU 记录。
-
-2. 中间 profile
-   - `profile_salex_pipeline.py` 只作为 kernel/debug profile，不能作为最终收益判断。
-   - 进入端到端前，优先使用 `test/eval/profile_matriscalculator_pipeline.py` stage profile。
-   - 不能把 profile-only 收益写成最终端到端收益。
-
-3. 多卡运行约束
-   - 后台实验必须显式设置 `CUDA_VISIBLE_DEVICES=<gpu_id>`。
-   - 不同实验必须使用不同 `RUN_NAME`、结果目录、summary 文件和 log 文件。
-   - 同一个对比组尽量不要跨 GPU 混跑；如果跨 GPU，summary 必须记录 GPU id。
-
-三、当前保留配置
-
-1. pure fuse p71 推荐配置
-
-```bash
-QUANT_MODE=p71_latency_pruned_fusion_only
-FUSION_MODE=p28_p26_all_ffn_mlp_input_grad_only
-MATRIS_P26_TAIL_INPUT_GRAD_ONLY=1
-MATRIS_P28_MLP_INPUT_GRAD_ONLY=1
-MATRIS_P29_MLP_BWD_KERNEL=1
-MATRIS_USE_CUDA_FUSED_LINE_ATTENTION=1
-MATRIS_USE_CUDA_FUSED_ATOM_ATTENTION=1
-MATRIS_USE_CUDA_DIRECTED2UNDIRECTED_AVERAGE=1
+```text
+基础 FP32 fuse
++ MLP/GatedMLP input-grad fuse
++ line/atom attention CUDA fused op
++ directed2undirected CUDA fused op
++ attn_line dense-GEMM/cuBLAS backward 大图路径
++ GatedMLP second-tail CUDA macro
++ second-tail macro 扩到 atom edge 和 atom/line node update
++ 构图 line_graph 阶段临时禁用 Python GC，降低 CPU 长尾
 ```
 
-说明：
-- `QUANT_MODE=p71_latency_pruned_fusion_only` 当前只作为“无量化 target 的配置名”使用。
-- 该配置实际 `targets=[]`，不会替换 Linear。
-- `MATRIS_W8A8_BACKEND` 和 `MATRIS_W8A8_DISABLE_FAST_WRAPPER` 是历史环境变量残留；当前 pure fuse 结果中没有 W8A8 Linear 替换，500 样本消融中去掉这两个变量后单次快 `0.318639 ms`，后续默认不再带这两个变量。
-- 如果需要严格复刻历史 p71 env 口径，可临时加回 `MATRIS_W8A8_BACKEND=cuda_wmma_tail_n128_parallel` 和 `MATRIS_W8A8_DISABLE_FAST_WRAPPER=1`。
+P115 的关键优化点
 
-2. 本次 baseline 命令模板
+P115 的核心不是普通“小 op 拼一起”，而是 compile 先发现了一个有效 backward 边界，然后落成手写 CUDA/C++ macro：
 
-```bash
-CUDA_VISIBLE_DEVICES=2 \
-/home/lht/miniconda3/envs/matris311/bin/python \
-test/eval/infer_salex_lmdb_quant.py \
-  --dataset-src /home/lht/lab/sAlex/val \
-  --model matris_10m_oam \
-  --task efsm \
-  --device cuda \
-  --precision-mode fp32 \
-  --quant-mode none \
-  --fusion-mode none \
-  --limit 500 \
-  --sample-seed 42 \
-  --activation-calibration-limit 64 \
-  --activation-calibration-seed 43 \
-  --measure-time \
-  --output-json results/fp32_baseline_replay_20260524/eval/summary.json \
-  --save-predictions results/fp32_baseline_replay_20260524/eval/predictions.jsonl
+```text
+LayerNorm backward
++ sigmoid / SiLU backward
++ gate/core multiply
++ second Linear input-grad
++ pre-second SiLU derivative
 ```
 
-3. 本次 pure fuse 命令模板
+当前实现位置：
+
+- Python 入口：`FusedInputGatedMLP._forward_after_first_projection`
+- CUDA/C++ op：`matris_op.gated_tail_second_silu_input_grad_macro`
+- 实现形态：CUDA tail backward + cuBLAS SGEMM + CUDA SiLU derivative epilogue
+- 覆盖模块：
+  - `attn_atom.edge_nonlinear_update`
+  - `refine_atom.edge_nonlinear_update`
+  - `attn_atom.node_nonlinear_update`
+  - `attn_line.node_nonlinear_update`
+  - 原 P113 覆盖的 line/refine GatedMLP second-tail 路径
+
+P115 + line graph GC guard 端到端结果
+
+| 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | energy_mae_natoms | force_mae | stress_mae | 成功样本 | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| P115 + line_graph GC guard | 500 | `70.504408` | `35.252204` | `14.183510` | `0.007654580501` | `0.021735981310` | `0.001431523006` | `500/500` | 当前 500 最佳 |
+| P115 + line_graph GC guard | 5000 | `70.541407` | `352.636495` | `14.176071` | `0.009076240317` | `0.025285672117` | `0.001527279890` | `4999/5000` | 当前 5000 最佳 |
+
+旧 P115 结果：
+
+| 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | 成功样本 | 说明 |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| P115 | 500 | `73.482076` | `36.741038` | `13.608761` | `500/500` | GC guard 前历史最佳 |
+| P115 | 5000 | `73.422104` | `367.037097` | `13.619877` | `4999/5000` | GC guard 前历史最佳 |
+
+P115 limit5000 跳过样本：
+
+- 处理索引：`1857`
+- `graph_id=219803`
+- 原因：`Detected 2 isolated atom. Calculation stopped`
+
+P115 当前保留/清理状态（2026-06-01）
+
+结论：当前应该保留 P115 主线，不继续粗暴删除旧 refine gate。
+
+当前执行口径：
+
+- 运行/汇报最佳候选时，只启用 P115 主线 env；compile、R-MACRO、P109、refine full backward 等实验入口不再接入端到端热路径。
+- 旧 refine gate 代码先保留为历史兼容路径，不继续作为优化方向，也不直接物理删除；此前粗暴绕过旧 refine gate 会变慢，说明这部分不能用“全删掉”处理。
+- standalone benchmark/profile/check 脚本可以作为历史记录保留，但它们不代表当前 endpoint 候选；只有 `infer_salex_lmdb_quant.py --measure-time` 的端到端结果用于更新最佳。
+- 之后如果要瘦身代码，必须按“删除一组旧 gate -> correctness -> limit500 endpoint”的顺序做，不能一次性大范围删 refine 分支。
+- 当前默认保留 `MATRIS_DISABLE_GC_DURING_LINE_GRAPH=1`，它只在 `line_graph_adjacency_list + tensor conversion` 周围临时禁用/恢复 Python GC，不改变图结构输出。
+- `MATRIS_USE_FAST_LINE_GRAPH=1` 是 Cython line_graph 实验路径：30 个真实样本 exact match，局部 line_graph mean 从 `0.749 ms` 到 `0.585 ms`，但端到端 limit500 与 GC guard 基本持平；因此默认关闭，仅作为后续更底层 C++/tensor line graph 的基线。
+
+保留内容：
+
+- P115 最佳优化栈和复跑命令保持不变。
+- 保留当前有效主线：
+  - `P26/P28/P29`
+  - line/atom attention CUDA fused op
+  - directed2undirected CUDA fused op
+  - `P101/P105/P106/P108`
+  - `P113/P114/P115`
+- 保留旧 refine gate 的原路径逻辑，但不把它们作为优化主线。
+
+已清理/取消接入：
+
+- 取消 compile/R-MACRO/refine full backward 实验入口。
+- 取消 `P109 refine_line FFN residual` 实验分支接入。
+- 取消 R-MACRO3 FFN cuBLAS/CUTLASS/grouped GEMM 分流接入。
+- 取消 `refine_line` detail profile 的 `timed_detail(lambda...)` 热路径包裹。
+- `infer_salex_lmdb_quant.py` 恢复到不带全模型 `torch.compile` endpoint 开关的计时口径。
+
+清理后复测：
+
+| 状态 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | 结论 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 清理前 current recheck | 500 | `75.653664` | `37.826832` | `13.218130` | 比历史 P115 慢，受实验代码/profile 包裹干扰 |
+| 清理 compile/R-MACRO/P109 后 | 500 | `75.146337` | `37.573169` | `13.307368` | 有改善，但仍慢 |
+| 再清理 refine `timed_detail` 后 | 500 | `73.789792` | `36.894896` | `13.552010` | 回到接近历史最佳档位，当前推荐保留状态 |
+| 粗暴绕过旧 refine gate | 500 | `74.718854` | `37.359427` | `13.383503` | 负收益，已撤回，不采用 |
+
+判断：
+
+- 主要拖慢源是后续 compile/R-MACRO/P109 和 refine profile wrapper，而不是旧 refine gate 本身。
+- 旧 refine gate 默认不开，但原路径里仍有一些对当前性能有益的普通分流/组合逻辑；粗暴绕过会变慢。
+- 因此只保留“清理实验入口 + 去掉 profile wrapper”的状态，不继续物理删除旧 refine 分支。
+- 历史正式最佳仍以 `73.482076 ms` / `73.422104 ms` 为准；当前清理后复测 `73.789792 ms` 属于同一档位，但不覆盖历史最佳。
+
+关键对照与加速比
+
+| 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | 成功样本 | 相对 P115 |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| FP32 baseline | 500 | `133.608348` | `66.804174` | - | `500/500` | P115 快 `1.818x` |
+| FP32 baseline | 5000 | `131.042806` | - | `7.631094` | `4999/5000` | P115 快 `1.785x` |
+| stable pure fuse anchor | 500 | `85.187982` | `42.593991` | `11.738745` | `500/500` | P115 快 `1.159x` |
+| P106 A-CUDA2 | 5000 | `84.457298` | `422.202033` | `11.840303` | `4999/5000` | P115 快 `1.150x` |
+| P108 A-CUDA3 | 5000 | `83.991692` | `419.874467` | `11.905940` | `4999/5000` | P115 快 `1.144x` |
+| P113 GatedMLP second-tail | 5000 | `81.062566` | `405.231769` | `12.336150` | `4999/5000` | P115 快 `1.104x` |
+| P115 all node + atom edge second-tail | 5000 | `73.422104` | `367.037097` | `13.619877` | `4999/5000` | 旧最佳 |
+| P115 + line_graph GC guard | 5000 | `70.541407` | `352.636495` | `14.176071` | `4999/5000` | 当前最佳 |
+
+当前最佳复跑命令
+
+limit500：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
+CUDA_HOME=/home/lht/miniconda3/envs/matris311 \
+PATH=/home/lht/miniconda3/envs/matris311/bin:$PATH \
+LD_LIBRARY_PATH=/home/lht/miniconda3/envs/matris311/lib:$LD_LIBRARY_PATH \
+MATRIS_DISABLE_GC_DURING_LINE_GRAPH=1 \
+MATRIS_USE_FAST_LINE_GRAPH=0 \
 MATRIS_P26_TAIL_INPUT_GRAD_ONLY=1 \
 MATRIS_P28_MLP_INPUT_GRAD_ONLY=1 \
 MATRIS_P29_MLP_BWD_KERNEL=1 \
 MATRIS_USE_CUDA_FUSED_LINE_ATTENTION=1 \
 MATRIS_USE_CUDA_FUSED_ATOM_ATTENTION=1 \
 MATRIS_USE_CUDA_DIRECTED2UNDIRECTED_AVERAGE=1 \
+MATRIS_P101_A3_LITE_ATTN_LINE_VJP=1 \
+MATRIS_P101_USE_NODE_INPUT_ATTENTION=0 \
+MATRIS_P105_A_CUDA1_ATTN_LINE_EDGE_ALPHA_BWD=1 \
+MATRIS_P106_A_CUDA2_ATTN_LINE_BWD_EDGE_DIRECT=1 \
+MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_OP_BWD=1 \
+MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_SCATTER_THRESHOLD=4096 \
+MATRIS_P113_GATED_TAIL_SECOND_SILU_MACRO=1 \
+MATRIS_P114_ATOM_EDGE_SECOND_TAIL=1 \
+MATRIS_P115_ALL_NODE_SECOND_TAIL=1 \
 /home/lht/miniconda3/envs/matris311/bin/python \
 test/eval/infer_salex_lmdb_quant.py \
   --dataset-src /home/lht/lab/sAlex/val \
@@ -198,268 +184,197 @@ test/eval/infer_salex_lmdb_quant.py \
   --activation-calibration-limit 64 \
   --activation-calibration-seed 43 \
   --measure-time \
-  --output-json results/fp32_fused_p71_replay_20260524/eval/summary.json \
-  --save-predictions results/fp32_fused_p71_replay_20260524/eval/predictions.jsonl
+  --output-json results/recheck_p115_all_node_atom_edge_second_tail_limit500/eval/summary.json \
+  --save-predictions results/recheck_p115_all_node_atom_edge_second_tail_limit500/eval/predictions.jsonl
 ```
 
-四、后续主线：只做 fuse 优化
+limit5000 时只替换：
 
-1. 优先方向
-   - 更大的 module-level fuse 边界，而不是单个小 kernel 小修。
-   - attention / refine block 内的等价 C++/CUDA macro。
-   - forward + backward + input-grad 一起考虑，避免 forward 快、force/stress backward 吐回收益。
-   - 减少 autograd glue、layout marker、reshape/contiguous、CPU range 和小 op 调度成本。
-   - 保持 FP32 数值路径，不引入量化误差变量。
+```bash
+  --limit 5000 \
+  --output-json results/recheck_p115_all_node_atom_edge_second_tail_limit5000/eval/summary.json \
+  --save-predictions results/recheck_p115_all_node_atom_edge_second_tail_limit5000/eval/predictions.jsonl
+```
 
-2. 候选边界
-   - `attn_line` 完整边界：
+CUDA extension 编译
+
+```bash
+cd /home/lht/lab_fuse/MatRIS/matris/model/op/src
+CUDA_HOME=/home/lht/miniconda3/envs/matris311 \
+PATH=/home/lht/miniconda3/envs/matris311/bin:$PATH \
+LD_LIBRARY_PATH=/home/lht/miniconda3/envs/matris311/lib:$LD_LIBRARY_PATH \
+/home/lht/miniconda3/envs/matris311/bin/python setup.py build_ext --inplace
+```
+
+注意：不要用 `setup.py build develop`。
+
+已保留的有效优化栈说明
+
+1. 基础 FP32 module/input-grad fuse
+
+- `MATRIS_P26_TAIL_INPUT_GRAD_ONLY=1`
+- `MATRIS_P28_MLP_INPUT_GRAD_ONLY=1`
+- `MATRIS_P29_MLP_BWD_KERNEL=1`
+- `--quant-mode p71_latency_pruned_fusion_only`
+- `--fusion-mode p28_p26_all_ffn_mlp_input_grad_only`
+- 目标：减少 MLP/GatedMLP input-grad 的 autograd 边界和小 kernel 开销。
+
+2. CUDA attention / directed2undirected 基础栈
+
+- `MATRIS_USE_CUDA_FUSED_LINE_ATTENTION=1`
+- `MATRIS_USE_CUDA_FUSED_ATOM_ATTENTION=1`
+- `MATRIS_USE_CUDA_DIRECTED2UNDIRECTED_AVERAGE=1`
+- 目标：把 line attention、atom attention、directed2undirected average 的关键路径改成 CUDA fused op。
+
+3. attn_line P108 dense-GEMM/cuBLAS backward
+
+- `MATRIS_P101_A3_LITE_ATTN_LINE_VJP=1`
+- `MATRIS_P101_USE_NODE_INPUT_ATTENTION=0`
+- `MATRIS_P105_A_CUDA1_ATTN_LINE_EDGE_ALPHA_BWD=1`
+- `MATRIS_P106_A_CUDA2_ATTN_LINE_BWD_EDGE_DIRECT=1`
+- `MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_OP_BWD=1`
+- `MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_SCATTER_THRESHOLD=4096`
+- 目标：大图 rows `>4096` 时走 C++/CUDA/cuBLAS dense-GEMM 路线，减少 `torch.cat`、alpha 临时 tensor、alpha add kernel 和部分 scatter glue。
+- 结果：limit5000 `83.991692 ms`，P113 之前的最佳。
+
+4. P113/P114/P115 GatedMLP second-tail macro
+
+- `MATRIS_P113_GATED_TAIL_SECOND_SILU_MACRO=1`
+- `MATRIS_P114_ATOM_EDGE_SECOND_TAIL=1`
+- `MATRIS_P115_ALL_NODE_SECOND_TAIL=1`
+- 目标：把 compile 发现的 `tail backward + second Linear input-grad + SiLU grad` 边界落成 CUDA macro，并扩到更多同形态 GatedMLP。
+- 结果：limit5000 `73.422104 ms`，当前最佳。
+
+当前 compile 结论
+
+compile 的价值：用于发现“什么边界值得写 CUDA macro”。
+
+目前最成功的 compile 边界：
 
 ```text
-edge_update
--> alpha_projection
--> attention_reduce
--> node_update
--> residual
+GatedMLP tail backward
++ second Linear input-grad
++ pre-second SiLU derivative
 ```
 
-   - `refine_line` / `refine_atom` 内 FFN + nonlinear update 的更大边界。
-   - full block macro 需要统一考虑：
+这个边界已经落成 P113/P114/P115 CUDA macro，并成为当前最佳。
+
+不建议继续的 compile endpoint 路线：
+
+1. refine_line 大边界 backward compile
+
+- 需要启用 `refine_line` manual VJP wrapper。
+- correctness：block0/block9 PASS。
+- endpoint：
+  - threshold=4096，无 warmup 排除：`87.750487 ms`
+  - threshold=8192，排除前 20 warmup：`74.544084 ms`
+- 结论：局部 microbench 很强，但 wrapper/cache/调度成本吃掉端到端收益；不采用。
+
+2. 不走 P104、保留 CUDA op、外层 compile refine_line forward
+
+- 开关：
+  - `MATRIS_COMPILE_REFINE_LINE_FORWARD=1`
+  - `MATRIS_COMPILE_REFINE_LINE_FORWARD_ROWS_THRESHOLD=0|8192`
+- smoke20：
+  - all rows：`78.737428 ms`
+  - rows>=8192：`75.196740 ms`
+- Dynamo 诊断：
+  - `matris_op.PyCapsule.gated_tail_second_silu_input_grad_macro` 是黑盒。
+  - `matris_op.PyCapsule.two_linear_silu_input_grad_backward_n128` 是黑盒。
+  - 内部 `profile_prefix/module_name` 会触发 recompile limit。
+- 结论：保留已有 CUDA op 后，compile 只能处理黑盒之间的小 glue，不适合作为 endpoint 优化。
+
+后续如果继续 compile 辅助 fuse，应回到：
 
 ```text
-node_update backward
--> attention backward
--> edge_update backward
--> alpha_projection backward
--> residual gradient merge
+局部 PyTorch baseline microbench
+-> torch_eager / torch_compile / cuda_fused 三模式对照
+-> 发现有效边界
+-> 写 CUDA/C++/cuBLASLt/CUTLASS macro
+-> 端到端 limit500 / limit5000 验证
 ```
 
-3. 当前不要做
-   - 不再扩大 W8A8 target 名单。
-   - 不再做 W4A8 / W4A4 / FP4 / NVFP4。
-   - 不再做 fake quant、torchao、activation calibration、quant target sweep。
-   - 不再做只对单个 Linear 或单个 second-tail 的量化替换。
-   - 不再把 isolated FFN / grouped small-GEMM / wrapper 级小修作为主线。
-   - 不再把 `profile_salex_pipeline.py` 的局部收益直接升级为端到端候选。
+不建议再直接把 compile 套在已有 CUDA fused 路径外层。
 
-五、历史量化结论归档
+当前 no-go 摘要
 
-以下内容不再作为后续主线，只保留为历史判断依据。
+这些方向已经筛过，除非后续 profile 给出新证据，否则不要直接重开。
 
-1. 曾经的安全 W8A8 候选
+1. 量化路线暂停
 
-| candidate | replaced Linear | latency ms | speedup vs same-run FP32 | status |
-|---|---:|---:|---:|---|
-| `refine_blocks_8_9` | 4 | `84.566677` | `1.020170x` | 历史 best safe W8A8，不再继续 |
-| `attn_line_blocks_8_9` | 4 | `84.674246` | `1.018874x` | 历史备选，不再继续 |
-| `refine_blocks_8_9_plus_attn_8_9` | 8 | `85.224064` | `1.012301x` | PASS but not mainline |
-| `p8d full saved-pre` | 24 | `87.057215` | `0.990985x` | 精度 PASS 但速度不保留 |
-| `refine_block_9` | 2 | `87.488758` | `0.986097x` | 历史小 PASS，不再作为最快候选 |
+- W8A8/W4A8/fake quant/torchao/activation calibration sweep 不再作为当前主线。
+- 当前最好结果都来自 FP32 fuse / CUDA macro。
 
-2. 停止量化的原因
-   - 单独替换几个 Linear 太窄，收益容易被 pack、dequant、saved-pre backward、input-grad、autograd glue 抵消。
-   - 大范围 refine/attn second-tail 组合没有线性叠加。
-   - atom/node 更敏感，且之前没有证明端到端收益。
-   - A800 不支持 Blackwell NVFP4 Tensor Core 原生收益。
-   - 当前可稳定汇报的主要收益来自 pure fuse / CUDA env 优化，而不是量化本身。
+2. Python manual VJP wrapper 不作为新主线
 
-六、归档索引
+- attn_line 早期 P101 仍保留在最佳路径中，因为它对当前栈有效。
+- refine_line R1/R2/R3 correctness 能过，但端到端不赢。
+- 后续不要新增 wrapper 级 VJP；如要接管 backward，应做真正 C++/CUDA macro。
 
-1. 当前 pure fuse 结果
-   - 本次 baseline：`results/fp32_baseline_replay_20260524/eval/summary.json`
-   - 本次 pure fuse run1：`results/fp32_fused_p71_replay_20260524/eval/summary.json`
-   - 本次 pure fuse run2：`results/fp32_fused_p71_replay_20260524_run2/eval/summary.json`
-   - 历史 p71 正式 5000：`results/p71_latency_pruned_eval5000_20260512_182005/eval/summary.json`
+3. attn_line P108 后局部修补暂停
 
-2. 历史 W8A8 / no-go 结果
-   - P92 安全 W8A8 复测：`results/p92_revalidate_safe_w8a8_summary.md`
-   - W8A8 latency ablation：`results/w8a8_latency_ablation_20260512_155035_summary.md`
-   - P90 backward chain bottleneck：`results/p90_w8a8_backward_chain_bottleneck_summary.md`
-   - P91A backward driver：`results/p91a_backward_driver_summary.md`
-   - P91B cuBLAS pair：`results/p91b_cublas_pair_summary.md`
-   - P94A saved-pre slim：`results/p94a_saved_pre_slim_summary.md`
-   - P94B dq_weight_t precompute：`results/p94b_precompute_dq_weight_t_summary.md`
-   - P95B group4 driver：`results/p95b_group4_driver_summary.md`
-   - P96B SiLU second-tail macro：`results/p96b_silu_second_tail_macro_summary.md`
-   - P97D group boundary feasibility：`results/p97d_group_boundary_feasibility_summary.md`
-   - P100A scaled epilogue feasibility：`results/p100a_w8a8_scaled_epilogue_feasibility_summary.md`
-   - P101A W8A8 候选分层诊断：`results/p101_w8a8_candidate_triage_summary.md`
-   - P101B W8A8 fast prepare：`results/p101b_w8a8_fast_prepare_summary.md`
+- grouped-alpha、split-edge、in-place-hidden、target-reduce、alpha-tiled 等方向 correctness PASS 但 endpoint 负收益。
+- P108 dense op 内 SGEMM 已占主要时间；继续优化需要 cuBLASLt/CUTLASS epilogue/fused scatter 级实现。
 
-3. 关键 pure fuse / module macro profiling 依据
-   - P74 attn/refine teacher module profile：`results/p74_attn_refine_teacher_module_profile_summary.md`
-   - P75 attn_line FP32 boundary probe：`results/p75_attn_line_fp32_boundary_probe_summary.md`
-   - P83C node input fusion：`results/p83c_node_input_summary.md`
-   - P93A refine 8-9 boundary audit：`results/p93a_refine_8_9_boundary_audit_summary.md`
-   - P93B attn 8-9 boundary audit：`results/p93b_attn_8_9_boundary_audit_summary.md`
-   - P93C combo 8-9 boundary audit：`results/p93c_combo_8_9_boundary_audit_summary.md`
-   - P96A full chain breakdown：`results/p96a_full_chain_breakdown_summary.md`
-   - P96C input-grad layout audit：`results/p96c_input_grad_layout_audit_summary.md`
-   - P98A attn_line macro audit：`results/p98a_attn_line_macro_audit_summary.md`
-   - P99A module-level 审计：`results/p99a_attn_line_module_boundary_feasibility_summary.md`
-   - P99B module-level autograd prototype：`results/p99b_attn_line_module_vjp_summary.md`
+4. refine_line/refine_atom 小分支暂停
 
-可以，我建议把后续规划从“继续抠单个 GatedMLP/MLP”改成 CUDA input-grad/macro 算子开发。目标不是再找一个 1ms 小点，也不是只在 Python 层包 autograd 边界，而是减少一整段里的 kernel launch、global memory 读写、中间 tensor materialize、layout/contiguous、scatter/reduce 边界。
+- R-CUDA1/2/3/4 小分支或 wrapper 级 full macro 多次不赢。
+- AT-CUDA1/P110/P111/P112 correctness 或 microbench 局部可行，但 endpoint 不赢。
+- 后续只有在 P115 profile 显示 refine_line/refine_atom 重新成为 top hotspot 时再重开。
 
-总目标
+5. residual epilogue 暂停
 
-当前最好是 85.19 ms 左右。下一阶段目标可以设成：
+- P116 full residual grad limit500：`76.133954 ms`
+- P116 input-grad-only limit500：`75.909410 ms`
+- 均慢于 P115 `73.482076 ms`。
+- residual glue 太小，单独或简单并入 macro 都不值得继续。
 
-阶段	目标
-短期	稳定进 84-85 ms
-中期	冲 80-83 ms
-激进	看是否能到 78-80 ms
-后续只做 FP32 fuse，不再做量化。
+下一步建议
 
-优先级 1：先做 attn_line CUDA macro
+优先级 1：profile 当前 P115 最佳路径
 
-这是我最建议优先做的方向，因为 line attention 相关消融收益很大：
+目标：
 
-去掉 CUDA fused line attention 慢 13.27 ms
-GatedMLP 的 line 相关组也都有正收益
-line graph 通常边数更大，kernel/glue 成本更敏感
-注意：早期 A1/A2/A3 的 Python manual VJP 试验已经证明收益不稳定，后续 A1/A2/A3 只作为边界定义参考，真正实现应改成下文 A-CUDA1/A-CUDA4。
-原始拆分如下：
+- 确认 P115 后新的 top hotspot。
+- 重点看：
+  - P113/P115 second-tail 内部 GEMM + SiLU epilogue 是否仍明显。
+  - attn_atom 是否接近或超过 attn_line。
+  - refine_line/refine_atom 是否重新成为主要热点。
+  - scatter/gather/copy_layout 是否有新的集中长尾。
 
-版本	边界	目标
-A1	line edge nonlinear_update + alpha_projection	先吃掉局部 MLP/GatedMLP + projection 边界
-A2	alpha_projection + attention_reduce	减少 attention 前后的 tensor materialize
-A3	edge_update -> alpha_projection -> attention_reduce -> node_update	做真正的 attn_line block macro
-A1/A2 是比较稳的中间形态；A3 收益最大，但 backward 复杂度也最大。
+优先级 2：P113/P115 内部 GEMM/epilogue 优化
 
-本次 attn_line macro 试跑记录：
+如果 profile 显示 P113/P115 内部仍是热点，考虑：
 
-| candidate | 对应边界 | limit500 latency | 数值 | 结论 |
-|---|---|---:|---|---|
-| P83C node-input fusion | A2 后半段：attention_reduce + node_update_input_concat | `87.448236 ms` | PASS：energy_mae_natoms `0.007654569198`，force_mae `0.021736049359`，stress_mae `0.001431525037` | 数值正确，但慢于当前最优 `85.187982 ms`，暂不纳入候选 |
-| P99B attn_line module VJP | A3：attn_line module 级 manual VJP | `81.983455 ms` | FAIL：energy_mae_natoms `0.180226376531`，force_mae `0.190234236788`，stress_mae `0.022316184463` | 速度有吸引力，但数值不可用，只能作为 debug 线索 |
-| P99B fixed node tail path | A3：补齐 node_nonlinear_update 的 `core_tail/gate_tail` 手写 VJP | `87.181563 ms`，total `43.590781 s` | PASS：energy_mae_natoms `0.007654572582`，force_mae `0.021735966586`，stress_mae `0.001431523371` | 数值修复成功，但慢于最新 best `85.187982 ms`；旧 `81.983455 ms` 主要来自漏掉 node tail linear，不能作为候选 |
-| P99B fixed no record_function | A3：同上，默认关闭 P99B profiler record 标记 | limit500 run1 `83.972188 ms` / run2 `85.165571 ms`，2-run avg `84.568879 ms`；limit5000 `85.193363 ms`，total `425.881620 s` | PASS：limit5000 energy_mae_natoms `0.009076242906`，force_mae `0.025285677209`，stress_mae `0.001527280570`；`4999/5000` 成功，跳过 1 个 isolated atom 样本 | 数值正确；limit500 有小收益，但 limit5000 与当前最优 `85.187982 ms` 基本持平，暂不替代稳定锚点 |
-| P101 A3-lite default | A3-lite：manual VJP 内复用 CUDA `line_edge_gather_cat` + `fused_line_attention_node_input` | limit500 `85.907556 ms`，total `42.953778 s` | PASS：energy_mae_natoms `0.007654576532`，force_mae `0.021735998652`，stress_mae `0.001431522610` | `node_input` 路径是负收益，慢于稳定锚点，默认组合不采用 |
-| P101 A3-lite no-node-input | A3-lite：manual VJP 内复用 CUDA `line_edge_gather_cat`，关闭 `fused_line_attention_node_input` | limit500 run1 `85.033367 ms` / run2 `84.385293 ms`，2-run avg `84.709330 ms`；limit5000 `85.018572 ms`，total `425.007841 s` | PASS：block9 harness；limit5000 energy_mae_natoms `0.009076241707`，force_mae `0.025285675848`，stress_mae `0.001527280864`；`4999/5000` 成功，跳过 1 个 isolated atom 样本 | 当前新的轻量候选；比稳定锚点快 `0.169410 ms`，比 P99B limit5000 快 `0.174791 ms`，收益较小，建议再复跑一次 limit5000 后决定是否替代稳定锚点 |
-| A1 recompute VJP prototype | A1：edge_nonlinear_update + alpha_projection | 未完成 500；约 5-6 structures/s | 未收完整 summary | recompute VJP 明显过慢，已撤掉实验代码；A1 后续必须做手写 input-grad backward / CUDA glue |
+- cuBLASLt/CUTLASS epilogue：合并 `GEMM output * SiLU derivative`。
+- grouped GEMM：减少多个 128x128 GEMM launch。
+- 注意：不要自己手写普通 GEMM kernel 去替代 cuBLAS。
 
-当前判断：P99B 数值问题已经定位并修复，根因是 fused GatedMLP 在 `core_second/gate_second is None` 时漏算 `core_tail/gate_tail`。修复后如果保留无条件 `torch.profiler.record_function` 会慢到 `87.181563 ms`；默认关闭该 profiler 标记后，P99B fixed 在 limit500 两次平均为 `84.568879 ms`，但 limit5000 复核为 `85.193363 ms`，与当前稳定锚点 `85.187982 ms` 基本持平。因此 P99B 当前保留为正确候选和 correctness harness 对照，不替代纯 fuse 最好结果。P101 A3-lite no-node-input 把 `edge_update input-grad + alpha_projection input-grad + attention backward + node_update input-grad` 继续放在一个 manual VJP 中组织，但关闭负收益的 `fused_line_attention_node_input`，只保留 CUDA `line_edge_gather_cat`，目前 limit5000 为 `85.018572 ms`，是新的轻量候选；由于收益只有 `0.169410 ms`，需要再次复跑确认稳定性。
+优先级 3：换新的 compile 边界找形态
 
-A3 correctness harness：
+只找尚未被 CUDA op 黑盒切断的 PyTorch baseline 局部边界。优先类似 P113 的长 elementwise/norm backward 链，不优先 scatter/reduce 小边界或 GEMM-heavy first projection。
 
-- 脚本：`test/eval/check_attn_line_a3_correctness.py`
-- 作用：对单个 `attn_line` block 分叉比较 reference path 与候选 macro，检查 `node_out`、`edge_out`、`grad_node`、`grad_edge`。
-- 默认候选：`p99b`，通过 `MATRIS_P99B_ATTN_LINE_MODULE_VJP=1` 打开；后续新的 A3 CUDA / input-grad macro 可以加到同一个候选表里复用。
-- 也可以不改脚本，直接传 `--candidate-env KEY=VALUE` 临时测试新的 CUDA 开关；reference path 会清掉对应候选 env，避免对照组被污染。
-- 默认阈值：`atol=2e-5`、`rtol=2e-5`；深层 block 的相对误差可能因梯度接近 0 偏大，主要看绝对误差和端到端精度。
+重要结果文件
 
-| harness run | output | checked | result | worst abs summary |
-|---|---|---:|---|---|
-| P99B block0 limit8 | `results/attn_line_a3_correctness/p99b_block0_limit8.json` | 8 | PASS | node_out `1.91e-6`，edge_out `1.19e-6`，grad_node `2.86e-6`，grad_edge `4.77e-7` |
-| P99B block9 limit8 | `results/attn_line_a3_correctness/p99b_block9_limit8.json` | 8 | PASS | node_out `1.91e-6`，edge_out `1.43e-6`，grad_node `7.63e-6`，grad_edge `9.54e-7` |
-| P101 block0 limit4 | `results/attn_line_a3_correctness/p101_block0_limit4.json` | 4 | PASS | node_out `9.54e-7`，edge_out `9.54e-7`，grad_node `1.43e-6`，grad_edge `4.77e-7` |
-| P101 block9 limit4 | `results/attn_line_a3_correctness/p101_block9_limit4.json` | 4 | PASS | node_out `9.54e-7`，edge_out `1.19e-6`，grad_node `4.77e-6`，grad_edge `4.77e-7` |
-| P101 no-node block9 limit4 | `results/attn_line_a3_correctness/p101_no_node_block9_limit4.json` | 4 | PASS | node_out `1.43e-6`，edge_out `9.54e-7`，grad_node `4.05e-6`，grad_edge `7.15e-7` |
+- P115 limit500：`results/p115_all_node_second_tail_limit500_20260526/eval/summary.json`
+- P115 limit5000：`results/recheck_p115_all_node_atom_edge_second_tail_limit5000/eval/summary.json`
+- P113 limit5000：`results/p113_gated_tail_second_silu_macro_limit5000_20260526/eval/summary.json`
+- P108 limit5000：`results/attn_line_macro_p108_a_cuda3_dense_gemm_op_cublas_hybrid4096_limit5000_20260525/eval/summary.json`
+- P106 limit5000：`results/recheck_p106_a_cuda2_limit5000_current/eval/summary.json`
+- FP32 baseline 5000：`results/fp32_baseline_replay5000_20260524/eval/summary.json`
+- refine_line backward compile endpoint：`results/p117_compile_refine_line_full_thr8192_warm20_limit500/eval/summary.json`
+- refine_line forward compile smoke：`results/p118_compile_refine_line_forward_thr8192_smoke20/eval/summary.json`
+- compile 专项清单：`MatRIS_compile任务清单.txt`
 
-下一阶段优化策略：从 Python manual VJP 转向 CUDA input-grad/macro 算子
 
-前面 P99B/P101/R1/R2/R3 已经说明：只在 Python/PyTorch 层用 `torch.autograd.Function` 包边界，correctness 可以做对，但端到端收益不稳定。原因是底层仍然会触发大量 `index_select`、`cat`、`index_add/scatter`、MLP tail backward 等小 CUDA kernel 和中间 tensor materialize；Python manual VJP 只是换了 autograd 调度方式，没有真正减少主要 memory traffic/kernel launch。
+继续盯 edge_alpha_project_scatter
+这里包含 edge update input-grad、alpha projection input-grad、source/target scatter。它已经 fused 过，但还是最重。当前样本里有 rows 7064 / 5088 / 2086，其中 2086 还走 tile32，小图 tile32 仍然偏贵。下一步可以先做 threshold sweep，比如 4096 -> 2048 -> 1024，看更早切到 dense-GEMM 是否更好。
 
-因此后续不再优先做新的“纯 Python manual VJP macro”。下一步任务改为：在已有 `matris_op` CUDA 扩展里新增或扩展 input-grad/macro 算子，先做局部 CUDA kernel，再逐步扩大边界。每个 CUDA 候选都必须先过单 block correctness harness，再跑 `infer_salex_lmdb_quant.py --measure-time` 端到端。
+不优先重写 attention reduce backward 本体
+fused_line_attention_backward_with_edge_direct_kernel 时间很小，继续优化它本体收益有限。更应该处理它前后的 contiguous/copy/index_add glue。
 
-优先级 1：attn_line CUDA macro
+node_update backward 还有空间，但不能简单再包一层
+它里面主要是 GatedMLP/GEMM/elementwise 链。P115 已经吃掉一部分，P116 residual 之前端到端失败，所以如果继续做，需要换成更大、更有针对性的 macro，而不是简单 residual add fuse。
 
-继续把 `attn_line` 作为第一优先级，但实现方式从 A3-lite manual VJP 改成真正 CUDA 算子。当前依据：
-
-- `no CUDA fused line attention` 慢 `13.27 ms`，line attention 是最大信号。
-- P101 A3-lite no-node-input limit5000 为 `85.018572 ms`，说明局部 CUDA gather/cat 是有一点收益的。
-- P99B/P101 证明 module 级 Python VJP 不稳定，下一步必须把 gather/cat/scatter/softmax backward/input-grad 边界继续下沉到 CUDA。
-
-建议拆成：
-
-| 版本 | CUDA 边界 | 目标 | 验证 |
-| --- | --- | --- | --- |
-| A-CUDA1 | `line_edge_gather_cat` backward/input-grad + alpha projection input-grad | 消除 attention 前 gather/cat 与 projection backward 的小 kernel/materialize | `check_attn_line_a3_correctness.py` block0/block9；limit500 |
-| A-CUDA2 | segment softmax weighted-sum backward CUDA 化/合并 | 减少 attention_reduce backward 的 scatter/gather 和中间 alpha/value 梯度写回 | 同上；若收益 >1ms 跑 3 次 500 |
-| A-CUDA3 | edge_update input-grad + alpha projection + attention backward 联合 kernel | 做真正有意义的 attn_line input-grad macro，但暂不吞 node_update | 同上；收益 >2ms 再跑 5000 |
-| A-CUDA4 | 加入 node_update input-grad/residual | 接近完整 attn_line block CUDA macro | 需要 block0/block9/多样本 harness + 5000 端到端 |
-
-注意：不要再做 recompute 版 A1，也不要只新增 Python wrapper。A-CUDA1/A-CUDA2 的目标是明确减少 CUDA kernel launch、global memory 读写和中间 tensor，而不是只减少 autograd 节点。
-
-优先级 2：refine_line CUDA macro
-
-refine_line 仍有信号，但 R1/R2/R3 已证明 Python manual VJP 路线负收益。后续 refine_line 只在 CUDA 层继续推进：
-
-- `no GatedMLP group refine_line_edge` 慢 `3.31 ms`
-- `no MLP group refine_line_node_ffn` 慢 `1.32 ms`
-- `no MLP group refine_line_edge_ffn` 慢 `1.63 ms`
-- R1/R2/R3 correctness 都能过，但端到端平均不赢，说明需要真正合并 gather/cat/smooth reduce/scatter/input-grad kernel。
-
-建议拆成：
-
-| 版本 | CUDA 边界 | 目标 | 验证 |
-| --- | --- | --- | --- |
-| R-CUDA1 | refine_line gather-cat + edge_nonlinear_update input-grad | 减少 `edge/atom/source/target` gather、cat 和 GatedMLP input-grad 边界 | `check_refine_line_macro_correctness.py` block0/block9；limit500 |
-| R-CUDA2 | smooth multiply + target scatter/index_add forward/backward | 合并 `nonlinear * smooth`、target reduce 和对应 input-grad | 同上；重点看 `grad_smooth/grad_atom` |
-| R-CUDA3 | edge_FFN/node_FFN input-grad 与 residual 回传合并 | 减少 FFN input-grad 与 residual 小边界，避免 Python VJP overhead | 同上；收益 <1ms 必须 3 次 500 |
-| R-CUDA4 | refine_line full input-grad macro | 把 gather-cat、edge_update、smooth reduce、FFN input-grad、residual 梯度统一到少数 CUDA op | 只有 R-CUDA1/2/3 单项有收益才做 |
-
-R4 备注：`refine_line` 路径没有 `directed2undirected average`，所以原 R4 对 line refine 不适用。directed2undirected glue 后续如果要做，应放到 `refine_atom` 或 atom graph attention/refinement 中。
-
-本次 refine_line macro 验证结果（2026-05-24）
-
-| 版本 | 开关/路径 | correctness | 500 样本 latency_ms_mean | total | 结论 |
-| --- | --- | --- | ---: | ---: | --- |
-| R1 P102 | `MATRIS_P102_REFINE_LINE_R1_FFN_PAIR_VJP=1` | PASS | `91.076948 ms` | `45.538474 s` | 负收益，不采用 |
-| R2 P103 | `MATRIS_P103_REFINE_LINE_R2_EDGE_UPDATE_EDGE_FFN_VJP=1` | PASS | `98.111736 ms` | `49.055868 s` | 明显负收益，不采用 |
-| R3 P104 run1 | `MATRIS_P104_REFINE_LINE_R3_BLOCK_VJP=1` | block0/block9 PASS | `84.416632 ms` | `42.208316 s` | 单次为正，但收益不足 1ms，需要复跑 |
-| R3 P104 run2 | 同上 | 同上 | `86.798359 ms` | `43.399180 s` | 负收益 |
-| R3 P104 run3 | 同上 | 同上 | `86.104462 ms` | `43.052231 s` | 负收益 |
-| R3 P104 3-run avg | 同上 | 同上 | `85.773151 ms` | `42.886576 s` | 比稳定锚点 `85.187982 ms` 慢 `0.585169 ms`，不纳入最优候选 |
-| R4 | refine_line + directed2undirected average | 不适用 | - | - | `refine_line` 路径没有 directed2undirected average，R4 对 line refine 不成立；该方向应归到 `refine_atom`/atom graph glue |
-
-当前判断：R1/R2/R3 都证明“Python manual VJP 包边界”没有稳定收益，R3 correctness 虽然通过，但 3-run 平均慢于当前纯 fuse 稳定锚点。因此当前“纯 fuse 最好结果”仍保守记录为稳定 anchor：`85.187982 ms`（500 样本 total `42.593991 s`，相对 baseline `133.608348 ms` 加速 `1.568394x`）。P101 A3-lite no-node-input 的 `85.018572 ms` 仍只作为轻量候选，等待再次 5000 样本复跑确认后再替代稳定锚点。
-
-优先级 3：attn_atom / refine_atom CUDA 补充线
-
-atom 侧仍有收益，但作为第三优先级，只在 line 侧 CUDA 框架和 harness 稳定后迁移。当前单项信号：
-
-| 方向 | 当前单项信号 | 后续 CUDA 化判断 |
-| --- | ---: | --- |
-| attn_atom_node | `1.52 ms` | 可复用 attn_line 的 node_update/input-grad CUDA 结构 |
-| attn_atom_edge | `1.85 ms` | 需要和 directed2undirected average 一起看，避免只移动边界 |
-| refine_atom_edge GatedMLP | `2.74 ms` | atom 侧最值得试探的单点，可作为第一条 atom CUDA 候选 |
-| refine_atom_node_ffn | `0.84 ms` | 单项太小，不单独做 Python/CUDA wrapper |
-| refine_atom_edge_ffn | `1.11 ms` | 只有能并入 refine_atom edge macro 时才做 |
-
-建议拆成：
-
-| 版本 | CUDA 边界 | 目标 | 验证 |
-| --- | --- | --- | --- |
-| AT-CUDA1 | refine_atom edge gather-cat + GatedMLP input-grad | 先试 atom 侧最大信号 `refine_atom_edge` | 新增 refine_atom harness 或扩展 refine_line harness；limit500 |
-| AT-CUDA2 | directed2undirected average forward/backward 与 edge delta glue | 把 atom graph 特有的 directed->undirected glue 与 edge path 合并 | 必须比较 `grad_edge` 和端到端 stress |
-| AT-CUDA3 | attn_atom edge/node input-grad macro | 复用 A-CUDA 的 attention backward/gather/scatter 经验 | line 侧 A-CUDA 有收益后再做 |
-
-全局测试口径
-
-每个 CUDA 候选都按以下顺序验证：
-
-1. 单 block correctness harness：先比较 forward 和输入梯度。attn_line 至少检查 `node_out/edge_out/grad_node/grad_edge`；refine_line 至少检查 `node_out/edge_out/grad_node/grad_edge/grad_smooth/grad_atom`。
-2. `py_compile` 和 CUDA extension 编译通过后，跑 limit500，固定 `sample_seed=42`。
-3. 如果收益 `< 1 ms`，至少跑 3 次 limit500，取平均后再判断。
-4. 如果收益 `> 2 ms` 或多个 CUDA 子项累计收益明确，再跑 limit5000。
-5. 最终结论只认端到端 `infer_salex_lmdb_quant.py --measure-time`，profile 只用于定位热点。
-
-每次记录必须同时包含：
-
-- `latency_ms_mean`
-- `latency_s_total` 或 `latency_ms_total`
-- `throughput_structures_per_s`
-- `energy_mae_natoms`
-- `force_mae`
-- `stress_mae`
-- 成功样本数/跳过样本原因
-
-当前执行顺序
-
-1. 保留当前纯 fuse 稳定 anchor：`85.187982 ms`，total `42.593991 s`，相对 baseline `133.608348 ms` 加速 `1.568394x`。
-2. P101 A3-lite no-node-input `85.018572 ms` 作为轻量候选，先再跑一次 limit5000 确认稳定性。
-3. 开始 A-CUDA1：attn_line gather-cat/projection input-grad CUDA 化，先接入 `check_attn_line_a3_correctness.py`。
-4. A-CUDA1 若收益稳定，再做 A-CUDA2 attention_reduce backward CUDA 合并。
-5. refine_line 只做 R-CUDA1/R-CUDA2 这种真正 CUDA kernel，不再新增 R 类 Python manual VJP。
-6. atom 侧先只保留 AT-CUDA1 作为补充试探，不展开全套 atom macro。
+copy/index_add/cat 是真实残余，但要并进大边界
+单独写一个 copy 或 final_add kernel 不值得；它们应该并进 edge_alpha_project_scatter 或 node_update macro。

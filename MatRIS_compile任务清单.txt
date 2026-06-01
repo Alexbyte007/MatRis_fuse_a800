@@ -1,0 +1,1601 @@
+MatRIS torch.compile 局部 fusion 实验清单
+
+当前原则
+
+- 不做 `torch.compile(model)` 全模型 compile。
+- 只找已有手写 CUDA fused op 对应的原始 PyTorch baseline，然后做局部 `torch.compile(..., dynamic=True)`。
+- 保留三种模式对照：
+  - `torch_eager`：原始 PyTorch 等价实现。
+  - `torch_compile`：同一 PyTorch 等价实现的局部 compile 版本。
+  - `cuda_fused`：当前手写 CUDA fused op。
+- 不删除、不改坏当前 CUDA fused op 路径；compile 实验只新增脚本和记录。
+- 第一轮必须使用 `dynamic=True`，因为 AI4Science 输入的原子数、边数、line rows 会随样本变化。
+- 如需检查 graph break / recompile，使用：
+
+```bash
+TORCH_LOGS="graph_breaks,recompiles" CUDA_VISIBLE_DEVICES=0 \
+/home/lht/miniconda3/envs/matris311/bin/python test/eval/benchmark_local_compile_attention.py ...
+```
+
+第一目标：attention reduce 局部 fused op
+
+对应关系：
+
+| 模式 | 实现 |
+| --- | --- |
+| `torch_eager` | `Dimwise_softmax + alpha * attn_edge_feat + aggregate` 的等价 PyTorch 实现 |
+| `torch_compile` | 上述 PyTorch 等价函数局部 `torch.compile(dynamic=True)` |
+| `cuda_fused` | `matris_op.fused_line_attention_forward/backward` |
+
+为什么先做这个：
+
+- 这是已有 `line attention CUDA fused op` 和 `atom attention CUDA fused op` 共享的底层算子。
+- 原始 PyTorch fallback 清楚：`Dimwise_softmax`、`source_alpha * value`、`target_alpha * value`、`aggregate(index_add/scatter_reduce)`。
+- 可以用真实模型运行时捕获的 `source_logits/target_logits/values/source_index/target_index/num_segments` 离线比较三种模式，避免全模型 compile 的 graph break 干扰。
+
+已新增脚本
+
+- `test/eval/benchmark_local_compile_attention.py`
+- `test/eval/benchmark_local_compile_attention_macro.py`
+- `test/eval/benchmark_local_compile_directed_average.py`
+- `test/eval/benchmark_local_compile_gated_tail.py`
+- `test/eval/benchmark_local_compile_gated_tail_second_macro.py`
+
+脚本行为：
+
+- 运行真实 sAlex 样本，monkeypatch `interaction_block.fused_line_attention_or_none` 只用于记录实际进入 CUDA fused attention 的输入。
+- 对同一批真实 attention case 离线比较：
+  - forward time
+  - forward+backward time
+  - `max_abs_error / mean_abs_error`
+  - rows、num_segments、line/atom case 类型
+- warmup 会先触发 compile，统计阶段不包含第一次 compile 时间。
+- 每次 timing 都使用 CUDA event 和 `torch.cuda.synchronize()`。
+
+推荐 smoke 命令
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+/home/lht/miniconda3/envs/matris311/bin/python test/eval/benchmark_local_compile_attention.py \
+  --limit 4 \
+  --max-cases 8 \
+  --warmup 2 \
+  --iters 8 \
+  --output-json results/compile_local_attention_smoke_20260526.json
+```
+
+带 graph break / recompile 日志：
+
+```bash
+TORCH_LOGS="graph_breaks,recompiles" CUDA_VISIBLE_DEVICES=0 \
+/home/lht/miniconda3/envs/matris311/bin/python test/eval/benchmark_local_compile_attention.py \
+  --limit 4 \
+  --max-cases 8 \
+  --warmup 2 \
+  --iters 8 \
+  --output-json results/compile_local_attention_smoke_logs_20260526.json
+```
+
+建议正式一点的局部 benchmark：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+/home/lht/miniconda3/envs/matris311/bin/python test/eval/benchmark_local_compile_attention.py \
+  --limit 20 \
+  --max-cases 32 \
+  --warmup 5 \
+  --iters 30 \
+  --output-json results/compile_local_attention_limit20_cases32_20260526.json
+```
+
+当前待记录结果
+
+| 日期 | 目标 | 结果文件 | 结论 |
+| --- | --- | --- | --- |
+| 2026-05-26 | local attention smoke，4 cases | `results/compile_local_attention_smoke_20260526.json` | 跑通三模式；`torch_compile` 可运行但明显慢于 `cuda_fused` |
+| 2026-05-26 | local attention，60 real cases，修正版 | `results/compile_local_attention_limit6_cases60_v2_20260526.json` | `torch_compile` 比 eager 快，但离 `cuda_fused` 很远；CUDA fused op 仍应保留 |
+| 2026-05-26 | `TORCH_LOGS="graph_breaks,recompiles"` smoke | `results/compile_local_attention_logs_smoke3_20260526.log` / `.json` | 未见 graph break / recompile；`dynamic=True` 当前覆盖该局部函数的小中 rows 输入 |
+| 2026-05-26 | 扩大边界：`alpha_projection + attention_reduce + node_update_input_concat`，60 real cases | `results/compile_local_attention_macro_limit6_cases60_20260526.json` | forward 收益很小，forward+backward 仍有收益，但不接近 CUDA fused macro 对照 |
+| 2026-05-26 | 更换目标：`directed2undirected average`，60 real cases | `results/compile_local_directed_average_limit6_cases60_20260526.json` | `torch_compile` 比 eager 更慢；CUDA fused 明显更快；该目标不适合继续 compile 化 |
+| 2026-05-26 | 更换目标：`GatedMLP tail input-grad` 长 elementwise 链 shape sweep | `results/compile_local_gated_tail_shape_sweep_20260526.json` | `torch_compile` 明显有效，约 `4.4x`；CUDA fused 仍更快，约 `9x`；这是目前最符合 compile fusion 的目标 |
+| 2026-05-26 | 扩大边界：`GatedMLP tail input-grad + second Linear input-grad + pre-second SiLU grad` | `results/compile_local_gated_tail_second_macro_shape_sweep_20260526.json` | `torch_compile` 约 `3.37-3.44x`，超过“CUDA tail + PyTorch matmul/SILU”的混合路径；说明 CUDA macro 应考虑继续扩大范围 |
+| 2026-05-26 | 参考 compile 边界新增 CUDA macro：`tail backward + cuBLAS second input-grad + CUDA SiLU grad epilogue` | `results/compile_local_gated_tail_second_macro_cuda_macro_shape_sweep_20260526.json` | 新 CUDA macro 明显超过 `torch_compile` 和旧 `cuda_tail_mixed`：dim128 平均 `7.34x`，v2 `8.03x`；dim256 平均 `6.55x`；证明 compile 边界可作为 CUDA macro 设计依据 |
+
+local attention 60 real cases 结果（2026-05-26）
+
+收集口径：
+
+- 真实 sAlex 样本，`sample_seed=42`。
+- 捕获 `fused_line_attention_or_none` 实际进入 CUDA fused attention 的输入。
+- 共 60 个 attention case：30 个 atom，30 个 line。
+- rows 范围：min `128`，mean `502.333333`，max `1520`。
+- 为了稳定捕获底层 attention reduce，benchmark 进程中关闭更外层 line manual VJP，只比较底层 `fused_line_attention_forward/backward` 对应的 PyTorch baseline。
+
+forward：
+
+| 模式 | weighted mean | 60 cases local total | 相对 eager |
+| --- | ---: | ---: | ---: |
+| `torch_eager` | `0.261702 ms` | `15.693210 ms` | `1.000x` |
+| `torch_compile` | `0.236530 ms` | `14.128742 ms` | `1.106x` |
+| `cuda_fused` | `0.079006 ms` | `4.218061 ms` | `3.312x` |
+
+forward + backward：
+
+| 模式 | weighted mean | 60 cases local total | 相对 eager |
+| --- | ---: | ---: | ---: |
+| `torch_eager` | `1.116763 ms` | `66.968576 ms` | `1.000x` |
+| `torch_compile` | `0.661242 ms` | `39.740416 ms` | `1.689x` |
+| `cuda_fused` | `0.085550 ms` | `4.755456 ms` | `13.054x` |
+
+数值误差：
+
+- `torch_compile` vs `torch_eager` 最大 forward abs error：`1.668930e-6`。
+- `torch_compile` vs `torch_eager` 最大 backward abs error：`2.145767e-6`。
+- `cuda_fused` vs `torch_eager` 最大 forward abs error：`1.907349e-6`。
+- `cuda_fused` vs `torch_eager` 最大 backward abs error：`1.430511e-6`。
+
+`TORCH_LOGS` 记录：
+
+- 第一次日志 smoke 曾出现 `values requires_grad mismatch` recompile；原因是同一个 compiled function 先用于 forward-only，再用于 forward+backward，`requires_grad` 状态不同。
+- 脚本已拆成 `torch_attention_forward_eval_template` 和 `torch_attention_forward_grad_template` 两个 compile wrapper 后复测。
+- 修正版日志 `results/compile_local_attention_logs_smoke3_20260526.log` 未发现 graph break / recompile。
+
+扩大边界实验：attention macro（2026-05-26）
+
+边界：
+
+```text
+alpha_projection
++ attention_reduce
++ node_update_input_concat
+```
+
+三模式定义：
+
+| 模式 | 实现 |
+| --- | --- |
+| `torch_eager` | PyTorch `edge_feat0 @ source/target_weight.T` + PyTorch segment attention reduce + `torch.cat([node, target, source])` |
+| `torch_compile` | 上述 macro 的局部 `torch.compile(dynamic=True)` |
+| `cuda_fused` | PyTorch alpha projection + `_CudaFusedLineAttention` + PyTorch cat |
+
+结果文件：
+
+- `results/compile_local_attention_macro_limit6_cases60_20260526.json`
+- `results/compile_local_attention_macro_logs_smoke_20260526.log`
+
+收集口径：
+
+- 同样 60 个真实 attention case：30 个 atom，30 个 line。
+- rows 范围：min `128`，mean `502.333333`，max `1520`。
+- 日志 smoke 未发现 graph break / recompile。
+
+forward：
+
+| 模式 | weighted mean | 60 cases local total | 相对 eager |
+| --- | ---: | ---: | ---: |
+| `torch_eager` | `0.331886 ms` | `19.880346 ms` | `1.000x` |
+| `torch_compile` | `0.314486 ms` | `18.819482 ms` | `1.055x` |
+| `cuda_fused` | `0.146217 ms` | `8.669389 ms` | `2.270x` |
+
+forward + backward：
+
+| 模式 | weighted mean | 60 cases local total | 相对 eager |
+| --- | ---: | ---: | ---: |
+| `torch_eager` | `1.269414 ms` | `75.891917 ms` | `1.000x` |
+| `torch_compile` | `0.751811 ms` | `44.805325 ms` | `1.688x` |
+| `cuda_fused` | `0.401521 ms` | `23.870259 ms` | `3.162x` |
+
+数值误差：
+
+- `torch_compile` vs `torch_eager` 最大 forward abs error：`1.430511e-6`。
+- `torch_compile` vs `torch_eager` 最大 backward abs error：`8.493662e-7`。
+- `cuda_fused` vs `torch_eager` 最大 forward abs error：`1.430511e-6`。
+- `cuda_fused` vs `torch_eager` 最大 backward abs error：`1.151115e-6`。
+
+扩大边界判断：
+
+- 相比只编 attention reduce，扩大到 `alpha_projection + attention_reduce + node_concat` 后，`torch_compile` 的 forward 收益从 `1.106x` 降到 `1.055x`，说明 Inductor 没能有效把 alpha matmul / cat 和 segment reduce 组合出更强融合。
+- forward+backward 仍约 `1.688x`，和 attention reduce 单独 compile 的 `1.689x` 基本一致，说明收益主要仍来自 attention reduce/backward 本体，而不是新增的 macro glue。
+- `cuda_fused` macro 对照从 attention reduce 单独的 `13.054x` forward+backward 降到 `3.162x`，原因是 macro 对照里 alpha projection 和 cat 仍是 PyTorch，CUDA fused 只覆盖中间 attention reduce；这说明扩大边界会稀释单个 fused op 的局部加速比。
+- 当前结论：扩大到这个 macro 边界没有让 `torch_compile` 接近 CUDA fused 路线，暂时不支持继续盲目扩大到 full interaction block。
+
+更换目标实验：directed2undirected average（2026-05-26）
+
+对应关系：
+
+| 模式 | 实现 |
+| --- | --- |
+| `torch_eager` | `zeros_like(out).index_add(0, directed2undirected, data) * 0.5` |
+| `torch_compile` | 上述 PyTorch 等价函数局部 `torch.compile(dynamic=True)` |
+| `cuda_fused` | `matris_op.directed2undirected_average_forward/backward` |
+
+结果文件：
+
+- `results/compile_local_directed_average_limit6_cases60_20260526.json`
+- `results/compile_local_directed_average_logs_smoke_20260526.log`
+
+收集口径：
+
+- 真实 sAlex 样本，捕获 `directed2undirected_average_or_none` 实际进入 CUDA fused op 的输入。
+- 60 个真实 case。
+- rows 范围：min `128`，mean `176.666667`，max `232`。
+- 日志 smoke 未发现 graph break / recompile。
+
+forward：
+
+| 模式 | weighted mean | 60 cases local total | 相对 eager |
+| --- | ---: | ---: | ---: |
+| `torch_eager` | `0.047557 ms` | `2.857011 ms` | `1.000x` |
+| `torch_compile` | `0.100352 ms` | `6.025318 ms` | `0.474x` |
+| `cuda_fused` | `0.021312 ms` | `1.280512 ms` | `2.231x` |
+
+forward + backward：
+
+| 模式 | weighted mean | 60 cases local total | 相对 eager |
+| --- | ---: | ---: | ---: |
+| `torch_eager` | `0.166012 ms` | `9.979546 ms` | `1.000x` |
+| `torch_compile` | `0.297260 ms` | `17.852109 ms` | `0.558x` |
+| `cuda_fused` | `0.027741 ms` | `1.666918 ms` | `5.984x` |
+
+数值误差：
+
+- `torch_compile` vs `torch_eager` forward/backward 最大 abs error：`0`。
+- `cuda_fused` vs `torch_eager` forward/backward 最大 abs error：`0`。
+
+directed average 判断：
+
+- 这是一个很小、规则很强的 gather/reduce op；PyTorch eager 本身已经很轻。
+- `torch_compile(dynamic=True)` 没有把它变快，反而因为 compile 生成路径/launch 开销使 forward 和 backward 都慢于 eager。
+- 手写 CUDA fused op 对这个规则场景非常合适，forward+backward 仍有 `5.984x` 相对 eager 的局部加速。
+- 当前结论：`directed2undirected average` 不适合作为后续 compile 目标，继续保留 CUDA fused op。
+
+更换目标实验：GatedMLP tail input-grad（2026-05-26）
+
+对应关系：
+
+| 模式 | 实现 |
+| --- | --- |
+| `torch_eager` | PyTorch 等价 backward：LayerNorm backward + SiLU/sigmoid gate backward + core/gate 两路 input-grad |
+| `torch_compile` | 上述 PyTorch 等价函数局部 `torch.compile(dynamic=True)` |
+| `cuda_fused` | `matris_op.input_grad_only_gated_tail_backward` |
+| `cuda_fused_v2` | `matris_op.input_grad_only_gated_tail_backward_n128_v2`，仅 dim=128 |
+
+结果文件：
+
+- `results/compile_local_gated_tail_shape_sweep_20260526.json`
+- `results/compile_local_gated_tail_logs_smoke_20260526.log`
+- `results/compile_local_gated_tail_logs_nonsquare_smoke_20260526.log`
+
+收集/测试口径：
+
+- 这是 synthetic shape sweep，不是端到端捕获；原因是 tail input-grad 是 backward cache 中间量，直接从真实模型捕获会侵入 autograd 路径。
+- rows：`128, 256, 512, 1024, 2048, 8192`。
+- dim：`128, 256`。
+- warmup `20`，iters `100`。
+- 数值误差最大约 `2.86e-6`，正常。
+
+summary：
+
+| dim | rows | `torch_compile` 平均相对 eager | `cuda_fused` 平均相对 eager |
+| ---: | --- | ---: | ---: |
+| 128 | `128,256,512,1024,2048,8192` | `4.411787x` | `8.952421x` |
+| 256 | `128,256,512,1024,2048,8192` | `4.464556x` | `9.679665x` |
+
+dim=128 逐 rows：
+
+| rows | `torch_compile` | `cuda_fused` | `cuda_fused_v2` |
+| ---: | ---: | ---: | ---: |
+| 128 | `4.546x` | `11.627x` | `11.872x` |
+| 256 | `4.461x` | `11.525x` | `11.806x` |
+| 512 | `4.483x` | `11.438x` | `12.023x` |
+| 1024 | `4.480x` | `9.198x` | `11.658x` |
+| 2048 | `4.463x` | `6.792x` | `10.333x` |
+| 8192 | `4.038x` | `3.134x` | `6.551x` |
+
+dim=256 逐 rows：
+
+| rows | `torch_compile` | `cuda_fused` |
+| ---: | ---: | ---: |
+| 128 | `4.491x` | `12.108x` |
+| 256 | `4.482x` | `12.035x` |
+| 512 | `4.470x` | `12.076x` |
+| 1024 | `4.492x` | `10.194x` |
+| 2048 | `4.509x` | `7.706x` |
+| 8192 | `4.342x` | `3.960x` |
+
+`TORCH_LOGS` 记录：
+
+- `results/compile_local_gated_tail_logs_smoke_20260526.log` 出现一次 recompile。
+- 原因：第一组 `rows=128, dim=128` 触发 Dynamo duck-shape，把 `args[0].size()[1] == args[0].size()[0]` 当成 guard。
+- 复测非 square rows：`results/compile_local_gated_tail_logs_nonsquare_smoke_20260526.log` 未发现 graph break / recompile。
+- 判断：这不是算子本身不稳定，而是 square shape 触发的动态 shape 特化；真实 rows 通常不等于 dim 时风险较小。
+
+GatedMLP tail 判断：
+
+- 这是目前最符合老师所说“torch.compile 能 fuse 长链 op”的目标。
+- 和 sparse segment attention / directed reduce 不同，`torch_compile` 在这个长 elementwise backward 链上确实有显著收益，约 `4.4x`。
+- 但手写 CUDA fused tail 仍整体更快，尤其 dim=128 的 v2 版本在大多数 rows 上明显领先。
+- 如果要展示 compile 的正面案例，可以用这个目标；如果目标是替代现有 CUDA fused op，当前还不够。
+
+扩大边界实验：GatedMLP tail + second input-grad macro（2026-05-26）
+
+边界：
+
+```text
+GatedMLP tail input-grad
++ core/gate second Linear input-grad
++ pre-second SiLU derivative
+```
+
+这个边界对应 GatedMLP backward 中从输出梯度往前的一段自然链：
+
+```text
+grad_out
+-> tail backward 得到 grad_core_second_out / grad_gate_second_out
+-> matmul(core_second_weight / gate_second_weight)
+-> 乘 pre-second SiLU derivative
+-> grad_core_first / grad_gate_first
+```
+
+三模式定义：
+
+| 模式 | 实现 |
+| --- | --- |
+| `torch_eager` | 全 PyTorch macro：tail backward + 两个 matmul + 两个 SiLU derivative |
+| `torch_compile` | 上述 macro 的局部 `torch.compile(dynamic=True)` |
+| `cuda_tail_mixed` | CUDA tail backward + PyTorch matmul/SILU derivative |
+| `cuda_tail_mixed_v2` | dim=128 时 CUDA tail v2 + PyTorch matmul/SILU derivative |
+
+结果文件：
+
+- `results/compile_local_gated_tail_second_macro_shape_sweep_20260526.json`
+- `results/compile_local_gated_tail_second_macro_logs_smoke_20260526.log`
+
+测试口径：
+
+- synthetic shape sweep。
+- rows：`128, 256, 512, 1024, 2048, 8192`。
+- dim：`128, 256`。
+- warmup `20`，iters `100`。
+- 日志 smoke 未发现 graph break / recompile。
+- 最大 abs error 约 `1.14e-5`，来自 matmul 后误差放大，仍在可接受范围。
+
+summary：
+
+| dim | rows | `torch_compile` 平均相对 eager | `cuda_tail_mixed` 平均相对 eager | `cuda_tail_mixed_v2` 平均相对 eager |
+| ---: | --- | ---: | ---: | ---: |
+| 128 | `128,256,512,1024,2048,8192` | `3.369298x` | `2.988454x` | `3.115564x` |
+| 256 | `128,256,512,1024,2048,8192` | `3.443754x` | `2.594558x` | - |
+
+dim=128 逐 rows：
+
+| rows | `torch_compile` | `cuda_tail_mixed` | `cuda_tail_mixed_v2` |
+| ---: | ---: | ---: | ---: |
+| 128 | `3.536x` | `3.217x` | `3.218x` |
+| 256 | `3.260x` | `3.011x` | `3.005x` |
+| 512 | `3.493x` | `3.174x` | `3.204x` |
+| 1024 | `3.473x` | `3.223x` | `3.243x` |
+| 2048 | `3.443x` | `3.198x` | `3.208x` |
+| 8192 | `3.012x` | `2.107x` | `2.816x` |
+
+dim=256 逐 rows：
+
+| rows | `torch_compile` | `cuda_tail_mixed` |
+| ---: | ---: | ---: |
+| 128 | `3.465x` | `1.693x` |
+| 256 | `4.195x` | `2.291x` |
+| 512 | `3.463x` | `3.211x` |
+| 1024 | `3.484x` | `3.227x` |
+| 2048 | `3.473x` | `3.203x` |
+| 8192 | `2.584x` | `1.943x` |
+
+扩大边界判断：
+
+- 这个结果支持“用 compile 扩大边界寻找 CUDA macro 形态”的思路。
+- 单独 tail input-grad 时，CUDA fused tail 明显强于 compile；但扩大到 `tail + second input-grad + SiLU grad` 后，`torch_compile` 反而超过了“CUDA tail + PyTorch 周边 glue”的混合路径。
+- 这说明当前 CUDA tail op 的边界偏小：tail kernel 本身快，但周围 matmul/SILU glue 留在 PyTorch 后，会吃掉一部分局部收益。
+- 如果继续做自定义 CUDA 优化，方向不应是只微调 tail backward kernel，而应考虑更大的 backward macro：
+
+```text
+tail backward
++ second Linear input-grad GEMM
++ pre-second SiLU derivative
+```
+
+- 真正实现上不一定是一颗全手写 kernel。更实际的形态可能是：
+  - CUDA tail backward 输出 grad_core/grad_gate；
+  - cuBLAS/cuBLASLt 做两个 input-grad GEMM；
+  - 用 fused epilogue 或后接轻量 CUDA kernel 合并 SiLU derivative；
+  - 或者 CUTLASS epilogue 把 GEMM output 直接乘 SiLU derivative。
+- 这条 compile 结果可以作为 CUDA macro 设计依据：边界扩大后有收益，且收益来自减少 tail 后的 PyTorch glue。
+
+CUDA macro 反推验证：GatedMLP tail + second input-grad + SiLU epilogue（2026-05-26）
+
+根据上一轮 compile 发现的有效边界，新增一个 feasibility CUDA macro：
+
+```text
+CUDA tail backward
+-> cuBLAS core/gate second Linear input-grad
+-> CUDA SiLU derivative epilogue
+```
+
+新增接口：
+
+- `matris_op.gated_tail_second_silu_input_grad_macro`
+- `use_tail_bwd_v2=True` 时仅支持 dim=128，复用已有 tail v2 kernel。
+
+结果文件：
+
+- `results/compile_local_gated_tail_second_macro_cuda_macro_smoke_20260526.json`
+- `results/compile_local_gated_tail_second_macro_cuda_macro_shape_sweep_20260526.json`
+
+测试口径：
+
+- synthetic shape sweep。
+- rows：`128, 256, 512, 1024, 2048, 8192`。
+- dim：`128, 256`。
+- warmup `20`，iters `100`。
+- 最大 abs error 约 `1.14e-5`，和 compile macro 同量级，主要来自 GEMM/elementwise 顺序差异。
+
+summary：
+
+| dim | rows | `torch_compile` 平均相对 eager | 旧 `cuda_tail_mixed` 平均相对 eager | 新 `cuda_macro` 平均相对 eager | 新 `cuda_macro_v2` 平均相对 eager |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 128 | `128,256,512,1024,2048,8192` | `3.512750x` | `3.070871x` | `7.339310x` | `8.027361x` |
+| 256 | `128,256,512,1024,2048,8192` | `3.313866x` | `3.014104x` | `6.548741x` | - |
+
+逐 rows 观察：
+
+- dim=128：新 `cuda_macro_v2` 在所有 rows 都快于 `torch_compile`；rows=8192 时 `cuda_macro_v2` `0.1351 ms`，`torch_compile` `0.1803 ms`。
+- dim=256：新 `cuda_macro` 在 rows `128-2048` 明显快于 `torch_compile`；rows=8192 时 `torch_compile` `0.3113 ms`，新 `cuda_macro` `0.3225 ms`，compile 略快，说明大 rows/dim256 后续需要 cuBLASLt/CUTLASS epilogue 或 grouped GEMM 继续减少边界。
+
+本轮判断：
+
+- 这次结果反过来证明：上一轮 compile 赢的是“小 CUDA tail op + PyTorch glue”的边界，而不是赢过合理扩大的 CUDA macro。
+- compile 仍然有价值，因为它帮助找到更自然的融合形态：`tail backward + second Linear input-grad + SiLU grad`。
+- 当前新 CUDA macro 只是 feasibility 版本，内部仍是 tail kernel + 两次 cuBLAS + 一个 epilogue kernel；如果要继续压榨，可尝试 cuBLASLt/CUTLASS 把 GEMM output 与 SiLU derivative epilogue 合并。
+
+端到端接入验证：P113 GatedMLP second-tail CUDA macro（2026-05-26）
+
+接入方式：
+
+- 新增 env：`MATRIS_P113_GATED_TAIL_SECOND_SILU_MACRO=1`。
+- 接入 `FusedInputGatedMLP._forward_after_first_projection` 的 FP32 two-linear 路径。
+- forward 保持原 PyTorch 语义：`SiLU(first) -> second Linear -> LayerNorm/SiLU/sigmoid tail`。
+- backward 使用 `matris_op.gated_tail_second_silu_input_grad_macro` 一次计算：
+
+```text
+tail backward
++ second Linear input-grad GEMM
++ pre-second SiLU derivative
+```
+
+端到端结果：
+
+- 命令口径：P108 best env + `MATRIS_P113_GATED_TAIL_SECOND_SILU_MACRO=1`，`sample_seed=42`。
+- limit500 结果文件：`results/p113_gated_tail_second_silu_macro_limit500_20260526/eval/summary.json`
+- limit5000 结果文件：`results/p113_gated_tail_second_silu_macro_limit5000_20260526/eval/summary.json`
+
+| 版本 | latency_ms_mean | latency_s_total | throughput_structures_per_s | energy_mae_natoms | force_mae | stress_mae |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| P108 recorded limit500 | `82.812756` | `41.406378` | `12.075434` | `0.007654580` | `0.021736003` | `0.001431525` |
+| P113 limit500 | `81.130946` | `40.565473` | `12.325753` | `0.007654569` | `0.021736001` | `0.001431522` |
+| P108 recorded limit5000 | `83.991692` | `419.874467` | `11.905940` | `0.009076243` | `0.025285668` | `0.001527280` |
+| P113 limit5000 | `81.062566` | `405.231769` | `12.336150` | `0.009076243` | `0.025285668` | `0.001527280` |
+
+相对 P108 limit500：
+
+- 快 `1.681810 ms`。
+- speedup `1.020730x`。
+- latency reduction `2.030858%`。
+
+相对 P108 limit5000：
+
+- 快 `2.929126 ms`。
+- speedup `1.036134x`。
+- latency reduction `3.487399%`。
+- 成功 `4999/5000`；跳过处理索引 `1857`，`graph_id=219803`，原因 `Detected 2 isolated atom. Calculation stopped`。
+
+当前判断：
+
+- P113 证明 compile 发现的 GatedMLP second-tail 边界可以穿透到端到端，不只是 synthetic microbench。
+- P113 已通过 limit5000 复核，正式替代 P108 成为当前最佳候选。
+- 后续再考虑 cuBLASLt/CUTLASS epilogue 进一步减少 `GEMM + SiLU epilogue` 边界。
+
+继续扩大 compile 边界：second-tail + first-projection input-grad（2026-05-26）
+
+目标是验证是否值得把 P113 CUDA macro 继续扩大到 first projection backward：
+
+```text
+tail backward
++ second Linear input-grad GEMM
++ pre-second SiLU derivative
++ cat([grad_core_first, grad_gate_first])
++ first projection input-grad GEMM
+```
+
+新增脚本：
+
+- `test/eval/benchmark_local_compile_gated_tail_second_first_macro.py`
+
+三模式定义：
+
+| 模式 | 实现 |
+| --- | --- |
+| `torch_eager` | 全 PyTorch full macro，一直算到 first projection input-grad |
+| `torch_compile` | 对上述 full macro 做局部 `torch.compile(dynamic=True)` |
+| `cuda_macro_plus_torch_first` | P113 CUDA macro 算到 `grad_core_first/grad_gate_first`，再用 PyTorch `cat + matmul(first_weight)` |
+| `cuda_macro_v2_plus_torch_first` | dim=128 时 P113 tail v2 + PyTorch first projection input-grad |
+
+结果文件：
+
+- `results/compile_local_gated_tail_second_first_macro_smoke_20260526.json`
+- `results/compile_local_gated_tail_second_first_macro_shape_sweep_20260526.json`
+- `results/compile_local_gated_tail_second_first_macro_logs_smoke_20260526.log`
+
+测试口径：
+
+- synthetic shape sweep。
+- rows：`128, 256, 512, 1024, 2048, 8192`。
+- dim：`128, 256`。
+- first input dim：`128, 384, 512`。
+- warmup `20`，iters `100`。
+- 最大 abs error：`2.288818e-4`，来自继续接 first projection GEMM 后误差放大；相对量级仍可接受。
+
+summary：
+
+| shape | `torch_compile` 平均相对 eager | `cuda_macro_plus_torch_first` 平均相对 eager | `cuda_macro_v2_plus_torch_first` 平均相对 eager |
+| --- | ---: | ---: | ---: |
+| dim128/input128 | `3.394050x` | `5.457790x` | `5.714852x` |
+| dim128/input384 | `3.314139x` | `5.385530x` | `5.607971x` |
+| dim128/input512 | `3.193467x` | `5.235046x` | `5.419656x` |
+| dim256/input128 | `3.134940x` | `4.876165x` | - |
+| dim256/input384 | `3.068107x` | `4.711378x` | - |
+| dim256/input512 | `3.015543x` | `4.503969x` | - |
+
+关键逐 rows 观察：
+
+- dim128/input384：compile 始终慢于 P113 mixed；rows=8192 时 compile `0.2954 ms`，P113 v2 mixed `0.2537 ms`。
+- dim128/input512：compile 始终慢于 P113 mixed；rows=8192 时 compile `0.3147 ms`，P113 v2 mixed `0.2723 ms`。
+- dim256/input384：rows `128-2048` compile 明显慢；rows=8192 时 compile `0.5414 ms`，P113 mixed `0.5544 ms`，compile 只小幅领先。
+- dim256/input512：rows `128-2048` compile 明显慢；rows=8192 时 compile `0.5744 ms`，P113 mixed `0.5888 ms`，compile 只小幅领先。
+
+`TORCH_LOGS="graph_breaks,recompiles"` smoke：
+
+- 未发现 graph break。
+- 发现一次 recompile：Dynamo 形成了 `args[0].size()[0] == 2*args[0].size()[1]` 的 duck-shape guard，换 rows 后触发重编译。
+- 这说明该更大 compile 边界在真实变 rows 数据上仍可能出现 shape guard/recompile，后续若继续扩大 compile 边界需要记录编译缓存行为。
+
+当前判断：
+
+- 平均来看，继续扩大 compile 到 first projection input-grad 没有超过 P113 CUDA macro + PyTorch first-backward glue。
+- 只有 dim=256、rows=8192 的超大 rows 形态 compile 略快，但差距约 `2.4%`，不足以支撑直接用 compile 替代当前 mixed 路径。
+- 这个实验没有给出“必须继续扩大 CUDA op 到 first projection”的强信号；如果继续做 CUDA，优先级应低于先复跑/limit5000 验证 P113 端到端稳定性。
+- 若未来 profile 显示 first projection input-grad 仍是热点，CUDA 扩大边界可以考虑，但应走 cuBLASLt/CUTLASS epilogue 或 grouped GEMM，而不是简单再包一层 Python/ATen glue。
+
+P113 后 profile + first-projection microbench 复核（2026-05-26）
+
+本轮目标：
+
+- profile 当前 P113 最佳路径，确认 P113 后新的 top hotspots。
+- 重新跑 `tail + second Linear input-grad + SiLU derivative + first projection input-grad` 的 `torch_eager / torch_compile(dynamic=True) / cuda_fused` 对照。
+
+结果文件：
+
+- stage profile：`results/p113_best_stage_profile_limit20_profile_20260526/stage_profile.json`
+- kernel ranking：`results/p113_best_kernel_ranking_limit8_20260526/summary.json`
+- kernel ranking markdown：`results/p113_best_kernel_ranking_limit8_20260526/summary.md`
+- first-projection shape sweep：`results/p113_compile_cuda_first_boundary_shape_sweep_20260526.json`
+
+stage ranking：
+
+| stage | mean ms | pct latency |
+| --- | ---: | ---: |
+| `model.interaction_blocks_ms` | `44.385450` | `44.96%` |
+| `model.force_stress.autograd_grad_ms` | `34.396412` | `34.84%` |
+| `graph_converter_ms` | `12.955431` | `13.12%` |
+| `module_forward.attn_line_ms` | `11.503053` | `11.65%` |
+| `module_forward.attn_atom_ms` | `11.373875` | `11.52%` |
+| `module_forward.refine_line_ms` | `9.572506` | `9.70%` |
+| `module_forward.refine_atom_ms` | `8.603853` | `8.71%` |
+
+kernel category ranking：
+
+| category | kernel ms | pct |
+| --- | ---: | ---: |
+| `gemm` | `82.917888` | `37.03%` |
+| `elementwise` | `56.888256` | `25.40%` |
+| `scatter_gather` | `20.887296` | `9.33%` |
+| `reduce_softmax` | `16.657600` | `7.44%` |
+| `copy_layout` | `13.251993` | `5.92%` |
+| `gated_tail_custom` | `11.270569` | `5.03%` |
+| `attention_custom` | `6.656896` | `2.97%` |
+
+关键 kernel：
+
+- `line_edge_silu_project_alpha_grad_scatter_backward_tile32_kernel`：`11.088270 ms / 70 calls`。
+- `input_grad_only_gated_tail_backward_kernel`：`8.889967 ms / 400 calls`。
+- `silu_input_grad_epilogue_kernel`：`0.891900 ms / 80 calls`。
+
+first-projection 扩边界复跑结果：
+
+| shape | compile speedup vs eager | P113 mixed speedup vs eager | 结论 |
+| --- | ---: | ---: | --- |
+| dim128/input384 | `3.289384x` | `5.100474x`，v2 `5.353473x` | P113 mixed 更快 |
+| dim128/input512 | `3.244922x` | `4.987844x`，v2 `5.253026x` | P113 mixed 更快 |
+| dim256/input384 | `2.970026x` | `4.436582x` | P113 mixed 更快 |
+| dim256/input512 | `2.887956x` | `4.223002x` | P113 mixed 更快 |
+
+逐 rows 只有 dim256 rows `8192` 时 compile 略快于 P113 mixed（约 `2%`），不足以改变方向。
+
+本轮判断：
+
+- P113 后新的热点是 GEMM + elementwise + scatter/copy 的组合，不是单个 tail kernel 独大。
+- `attn_atom` 已经接近 `attn_line`，更值得作为下一条 compile/profile 基建方向。
+- first-projection 扩边界 compile 不值得继续；也暂不建议把 P113 CUDA macro 扩到 first projection。
+- 如果继续 P113，应做 kernel 内部优化：cuBLASLt/CUTLASS epilogue、grouped GEMM、合并 `GEMM output * SiLU derivative`。
+
+按 compile 自身收益比较边界扩大（2026-05-26）
+
+这个比较只看 `torch_compile(dynamic=True)` 相对同边界 `torch_eager` 的 speedup，用来判断“边界是否适合 Inductor fuse”。它不以 CUDA op 为主要参照。
+
+| compile 边界 | 结果文件 | 平均 compile speedup vs eager | 观察 |
+| --- | --- | ---: | --- |
+| GatedMLP tail input-grad | `results/compile_local_gated_tail_shape_sweep_20260526.json` | `4.438x` | 最适合 compile 的纯 elementwise/norm backward 链 |
+| tail + second Linear input-grad + SiLU grad | `results/compile_local_gated_tail_second_macro_shape_sweep_20260526.json` | `3.407x` | speedup 比 tail-only 低，但边界更完整，且曾超过旧 CUDA-tail + PyTorch glue 混合路径，因此有设计价值 |
+| tail + second + SiLU + first projection，旧 sweep | `results/compile_local_gated_tail_second_first_macro_shape_sweep_20260526.json` | `3.187x` | 继续扩大后 compile 仍快于 eager，但收益继续下降 |
+| tail + second + SiLU + first projection，新 sweep | `results/p113_compile_cuda_first_boundary_shape_sweep_20260526.json` | `3.098x` | 加入 rows=4096 后趋势仍一致；大 rows 下收益明显下降 |
+
+按 shape 看：
+
+| 边界 | shape | compile speedup vs eager |
+| --- | --- | ---: |
+| tail-only | dim128 | `4.412x` |
+| tail-only | dim256 | `4.465x` |
+| tail + second + SiLU | dim128 | `3.369x` |
+| tail + second + SiLU | dim256 | `3.444x` |
+| tail + second + SiLU + first | dim128/input384 | `3.289x` |
+| tail + second + SiLU + first | dim128/input512 | `3.245x` |
+| tail + second + SiLU + first | dim256/input384 | `2.970x` |
+| tail + second + SiLU + first | dim256/input512 | `2.888x` |
+
+结论：
+
+- 如果只按 compile 自身收益看，最佳边界是 `GatedMLP tail input-grad`，约 `4.4x`。
+- 扩到 `tail + second Linear input-grad + SiLU grad` 后，compile speedup 降到约 `3.4x`，但它覆盖了更多真实 glue，因此仍然是有价值的 fuse 形态发现。
+- 再扩到 first projection 后，compile speedup 继续降到约 `3.1x`，且 rows 越大下降越明显；这个信号说明“继续扩大边界”对 compile 本身也没有变得更好。
+- 因此后续用 compile 辅助 fuse 时，应该优先寻找类似 tail backward 的长 elementwise/norm 链，或中等边界的 glue macro；不要默认认为越大边界越好。
+
+判断口径
+
+- 如果 `torch_compile` 明显接近 `cuda_fused`，再考虑扩大 compile 边界到更大的纯 PyTorch attention/refine 子图。
+- 如果 `torch_compile` 只接近 `torch_eager`，或者仍明显慢于 `cuda_fused`，说明当前手写 CUDA fused op 仍然值得保留。
+- 如果 `TORCH_LOGS` 显示频繁 recompile，先记录触发原因；暂时不大改 dataloader。
+- 只有当动态 compile 结果有希望但 recompile 明显拖累时，再考虑后续做 N/E/rows bucket + padding 的静态分桶 compile。
+
+当前结论
+
+- 对 attention reduce 这个局部子图，`torch.compile(dynamic=True)` 能带来一定 fusion 收益，但没有接近手写 CUDA fused op。
+- 当前手写 CUDA fused attention op 应继续保留。
+- 已尝试扩大到 `alpha_projection + attention_reduce + node_update_input_concat`，收益没有明显改善；不建议立刻扩大到全模型 compile。
+- 已更换目标到 `directed2undirected average`，结果为 compile 负收益；该目标也不建议继续。
+- 已更换目标到 `GatedMLP tail input-grad`，compile 明显正收益，是目前最值得作为 compile fusion 展示的局部目标；但 CUDA fused op 仍应保留。
+- 已扩大 GatedMLP tail 边界到 `tail + second input-grad + SiLU grad`，compile 超过 CUDA-tail-only 混合路径，说明这块值得作为后续 CUDA macro 设计参考。
+- 目前这组局部测试没有显示需要马上做 N/E bucket + padding；如果扩大 compile 边界后出现 shape guard/recompile，再考虑静态分桶。
+
+下一步 compile 线建议
+
+- 不建议继续在已有强手写 CUDA op 上做局部 compile 替代，因为 attention reduce 和 directed2undirected 两个代表目标都没有接近 CUDA。
+- 如果还要继续 compile 线，优先围绕 GatedMLP tail macro 继续做真实路径验证：捕获或构造来自真实模块的 tail cache rows 分布，然后比较 `tail + second input-grad + SiLU grad` 是否能作为后续 CUDA/CUTLASS macro 的候选边界。
+- 另一个方向是转向“尚未被自定义 CUDA op 覆盖、且 PyTorch glue 较多”的区域，例如普通 MLP/GatedMLP 非 fused fallback、refine/attention 里未替换的 cat/index_select/add/mul 小链路。
+- 每个新目标仍按当前三模式口径记录：`torch_eager` / `torch_compile(dynamic=True)` / `cuda_fused 或现有最优路径`。
+
+换边界搜索记录（2026-05-26）
+
+目标：不再沿 P113 往 first projection GEMM 扩，而是重新找非 GEMM 或非纯 GEMM 的局部 fuse 边界。
+
+新增脚本：
+
+- `test/eval/benchmark_local_compile_mlp_input_grad.py`
+- `test/eval/benchmark_local_compile_refine_smooth_reduce.py`
+
+已测边界：
+
+| 边界 | 结果文件 | compile speedup vs eager | CUDA speedup vs eager | 判断 |
+| --- | --- | ---: | ---: | --- |
+| `attn_atom` reduce-only | `results/compile_local_attention_atom_reduce_limit6_cases60_20260526.json` | forward `1.101x`；forward+backward `1.699x` | forward `3.322x`；forward+backward `12.483x` | compile 有一点收益，但离手写 CUDA 很远 |
+| `attn_atom` macro | `results/compile_local_attention_atom_macro_limit6_cases60_20260526.json` | forward `1.257x`；forward+backward `1.670x` | forward `2.808x`；forward+backward `5.299x` | 比 reduce-only 稍好，但仍不是强 compile 边界 |
+| MLP/FFN SiLU grad elementwise | `results/compile_local_mlp_input_grad_shape_sweep_20260526.json` | `0.774x` | `3.653x` | compile 负收益；不适合作为下一主线 |
+| MLP/FFN full input-grad：`grad_out @ W2 + SiLU grad + grad_hidden @ W1` | `results/compile_local_mlp_input_grad_shape_sweep_20260526.json` | `0.791x` | `2.599x` | 两次 GEMM 占主导，compile 不适合；现有 CUDA/ATen 路线保留 |
+| `refine_line` smooth multiply + target reduce + backward scatter | `results/compile_local_refine_smooth_reduce_shape_sweep_v2_20260526.json` | forward `0.948x`；forward+backward `1.939x` | forward `3.654x`；forward+backward `5.448x` | scatter/reduce 小边界 CUDA 有价值，但 compile 不适合替代 |
+
+补充说明：
+
+- `results/compile_local_refine_smooth_reduce_shape_sweep_20260526.json` 第一版因为 `Tensor.item()` 触发 graph break，只保留为诊断记录。
+- 修正版 `v2` 改为传 Python `int num_nodes`，未再出现 graph break 警告。
+- MLP/FFN input-grad 在 rows `8192` 时 CUDA full input-grad 也开始不占优，说明大 rows 下 GEMM/ATen 路线本身很强；这类方向若继续优化，应走 cuBLASLt/CUTLASS/grouped GEMM，不是普通 compile 扩边界。
+
+本轮结论：
+
+- `attn_atom`、`refine_line smooth reduce` 都属于 scatter/reduce 类，小边界 compile 信号弱到中等，但手写 CUDA 明显强；它们不适合作为下一条 compile 辅助 fuse 主线。
+- 普通 MLP/FFN input-grad 也不是好边界，原因是 elementwise 链短、两次 GEMM 占主导，compile speedup 反而低于 eager。
+- 当前仍然最像“老师说的长 fusion”的成功形态是 GatedMLP tail backward，也就是 layernorm backward + sigmoid/SiLU backward + gate/core elementwise 链。P113 已经把它扩大到 `tail + second input-grad + SiLU grad` 并形成当前最佳候选。
+- 下一步若继续找新边界，优先找“长 elementwise/norm/backward 链”，不要优先找 scatter/reduce 小边界或 GEMM-heavy FFN 边界。
+
+建议下一步：
+
+1. 从 P113 profile 的 `elementwise` 类继续下钻，按 kernel 名把剩余长 elementwise 链归属到模块。
+2. 优先排查是否还有未被 P113 覆盖的 GatedMLP tail-like backward，例如不同 dim、不同模块作用域、或周边 residual/add/mul glue。
+3. 如果找不到新的长 elementwise 链，compile 线暂时停止扩大，转为 P113 内部优化：cuBLASLt/CUTLASS epilogue、grouped GEMM、合并 `GEMM output * SiLU derivative`。
+
+P113-like 长 elementwise/norm 链搜索（2026-05-26）
+
+目标：不再优先找 attention/refine 的 scatter/reduce 小边界，而是沿 P113 成功形态寻找：
+
+```text
+second Linear input-grad
++ pre-second SiLU derivative
++ LayerNorm backward
++ sigmoid / SiLU backward
++ gate/core multiply glue
+```
+
+新增/调整：
+
+- `test/eval/profile_p113_elementwise_attribution.py`：给 P113 macro 加 record range，并把 elementwise/norm/copy/gated_tail kernel 归属到 interaction 模块。
+- `MATRIS_P114_REFINE_ATOM_EDGE_SECOND_TAIL=1`：把 P113 second+tail macro 扩到 `refine_atom.edge_nonlinear_update`。
+- `MATRIS_P114_ATOM_EDGE_SECOND_TAIL=1`：把 P113 second+tail macro 扩到 `attn_atom.edge_nonlinear_update + refine_atom.edge_nonlinear_update`。
+- `MATRIS_P115_ATOM_NODE_SECOND_TAIL=1`：把同形态扩到 `attn_atom.node_nonlinear_update`。
+- `MATRIS_P115_LINE_NODE_SECOND_TAIL=1`：把同形态扩到 `attn_line.node_nonlinear_update`。
+- `MATRIS_P115_ALL_NODE_SECOND_TAIL=1`：同时扩到 atom/line node_nonlinear_update。
+
+profile 证据：
+
+- P114 attribution：`results/p114_atom_edge_second_tail_attr_profile4_20260526/summary.json`
+- P114 命中范围包括 `attn_atom.edge_nonlinear_update`、`refine_atom.edge_nonlinear_update`、`refine_line.edge_nonlinear_update`。
+- top range 仍是 `LayerNorm + SiLU + sigmoid + mul`，说明这次命中的是 P113 同类长 elementwise/norm 链，不是 scatter/reduce 小边界。
+
+limit500 单次筛选：
+
+| 候选 | 额外 env | latency_ms_mean | total | throughput | 成功 | 相对 P113 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| P113 best | `MATRIS_P113_GATED_TAIL_SECOND_SILU_MACRO=1` | `81.130946` | `40.565473 s` | `12.325753/s` | `500/500` | - |
+| P114 atom edge | `MATRIS_P114_ATOM_EDGE_SECOND_TAIL=1` | `78.322629` | `39.161314 s` | `12.767702/s` | `500/500` | `-2.808318 ms` |
+| P115 atom node + P114 | `MATRIS_P115_ATOM_NODE_SECOND_TAIL=1` + P114 | `76.178010` | `38.089005 s` | `13.127148/s` | `500/500` | `-4.952936 ms` |
+| P115 line node + P114 | `MATRIS_P115_LINE_NODE_SECOND_TAIL=1` + P114 | `76.313754` | `38.156877 s` | `13.103798/s` | `500/500` | `-4.817192 ms` |
+| P115 all node + P114 | `MATRIS_P115_ALL_NODE_SECOND_TAIL=1` + P114 | `73.482076` | `36.741038 s` | `13.608761/s` | `500/500` | `-7.648870 ms` |
+
+P115 all node + P114 accuracy：
+
+- `energy_mae_natoms=0.007654576930`
+- `force_mae=0.021735995319`
+- `stress_mae=0.001431522633`
+
+当前判断：
+
+- 已找到比 P113 更强的同类 fuse 形态：所有 interaction 中可用的 GatedMLP `second + tail` 长 elementwise/norm backward 链。
+- 这个方向明显优于继续找 attention/refine scatter/reduce 小边界。
+- P115 all node + P114 已通过 limit5000，晋升为当前最佳候选。
+
+P115 limit5000：
+
+| latency_ms_mean | total | throughput | 成功 | energy_mae_natoms | force_mae | stress_mae |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `73.422104` | `367.037097 s` | `13.619877/s` | `4999/5000` | `0.009076239566` | `0.025285662142` | `0.001527281265` |
+
+对比 P113 limit5000：
+
+- P113：`81.062566 ms`，`405.231769 s`，`12.336150/s`
+- P115：`73.422104 ms`，`367.037097 s`，`13.619877/s`
+- P115 快 `7.640463 ms`，约 `1.1041x`
+
+下一步：
+
+- profile P115 当前最佳路径，确认新的热点排序。
+- 如果继续用 compile 辅助 fuse，继续按 P115 经验找长 elementwise/norm backward 链，不优先找 scatter/reduce 小边界。
+
+P115 同类结构继续搜索（2026-05-26）
+
+继续查找可直接复用 P113/P115 `GatedMLP second+tail` macro 的同类结构，结果如下：
+
+- P115 最佳 env 下，运行时只有 `60` 个 GatedMLP/FusedInputGatedMLP，全部位于 interaction blocks。
+- 这 `60` 个模块全部已经是 `FusedInputGatedMLP`，且 `core_second=True`、`fused_tail=True`。
+- 当前 readout/head 配置使用 MLP，不存在额外 GatedMLP head 可直接复用。
+- 新 profile：`results/p115_all_node_atom_edge_elementwise_attr_profile4_20260526/summary.json`
+
+结论：
+
+- 直接“找更多同类 GatedMLP second+tail 结构并复用 P113 macro”的空间已经基本用完。
+- 后续若继续沿 compile/fuse 边界找收益，应从相邻 glue 入手，而不是继续找同类作用域：
+  - `GatedMLP output + residual/add/mul`；
+  - `_forward_after_first_activation` 对应的 first-SiLU fused 兄弟路径；
+  - 普通 MLP/FFN/readout MLP 的独立长链，如果 profile 显示它们成为新热点。
+
+Residual glue 局部 compile microbench（2026-05-26）
+
+目标：先不写 CUDA，单独测试 P115 后相邻边界：
+
+```text
+out = update + res_weight * old_feat
+
+backward:
+grad_update = grad_out
+grad_old = grad_out * res_weight
+grad_res_weight = sum(grad_out * old_feat)
+```
+
+新增脚本：
+
+- `test/eval/benchmark_local_compile_residual_glue.py`
+
+P115 profile 中 residual stage：
+
+- profile 文件：`results/p115_all_node_atom_edge_elementwise_attr_profile4_20260526/summary.json`
+- `refine_line/refine_atom` residual stage 共 `20` 个。
+- `sum_mean_ms ~= 1.950858 ms`。
+- 单个 residual stage 约 `0.094-0.100 ms`。
+
+microbench 结果：
+
+| 模式 | 边界 | eager avg | compile avg | compile speedup vs eager | 结论 |
+| --- | --- | ---: | ---: | ---: | --- |
+| default | single forward | `0.023961 ms` | `0.071760 ms` | `0.3339x` | compile 明显更慢 |
+| default | single forward+backward | `0.050802 ms` | `0.099081 ms` | `0.5183x` | compile 更慢 |
+| default | node+edge pair forward+backward | `0.087566 ms` | `0.143933 ms` | `0.6314x` | compile 更慢 |
+| reduce-overhead | single forward | `0.024307 ms` | `0.097549 ms` | `0.2492x` | compile 更慢 |
+| reduce-overhead | single forward+backward | `0.050864 ms` | `0.112642 ms` | `0.4622x` | compile 更慢 |
+| reduce-overhead | node+edge pair forward+backward | `0.086810 ms` | `0.136882 ms` | `0.6847x` | compile 更慢 |
+
+结果文件：
+
+- `results/compile_local_residual_glue_shape_sweep_20260526.json`
+- `results/compile_local_residual_glue_reduce_overhead_shape_sweep_20260526.json`
+
+判断：
+
+- residual glue 是真实存在的小热点，但单独边界太小，`torch.compile(dynamic=True)` 没有帮助。
+- 目前不建议为“单独 residual glue”写 CUDA op；收益上限大约只有 `~2 ms`，而单独 CUDA launch/reduce 参数梯度可能吃掉收益。
+- 如果未来要做，应该并入更大的 CUDA macro，也就是把 residual forward/backward 直接塞进 P113/P115 的 GatedMLP macro epilogue，而不是新增独立 residual op。
+
+P116：把 residual epilogue 并入 GatedMLP macro 的 CUDA 尝试（2026-05-26）
+
+目标：验证上一节的“只适合并入 P113/P115 macro epilogue”是否能转化为端到端收益。
+
+新增开关：
+
+```bash
+MATRIS_P116_GATED_TAIL_SECOND_RESIDUAL_MACRO=1
+```
+
+实现：
+
+- 新增 CUDA/C++ wrapper `gated_tail_second_silu_residual_input_grad_macro`。
+- 复用 P113 `tail backward + second Linear input-grad + pre-second SiLU grad`，额外处理：
+  - forward：`out = update + res_weight * old_feat`
+  - backward：`grad_old = grad_out * res_weight`
+- 只接入 attention node residual 这种直接相邻边界；refine residual 暂不接入。
+
+端到端 limit500：
+
+| 候选 | latency_ms_mean | total | throughput | 成功 | 结论 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| P116 full residual grad | `76.133954` | `38.066977 s` | `13.134744/s` | `500/500` | 额外 `grad_res_weight` reduce 后负收益 |
+| P116 input-grad-only | `75.909410` | `37.954705 s` | `13.173597/s` | `500/500` | 去掉 reduce 后仍慢于 P115 |
+
+对比：
+
+- 当前最佳 P115 limit500：`73.482076 ms`
+- P116 input-grad-only 比 P115 慢 `2.427334 ms`
+
+结论：
+
+- compile 发现的 residual glue 小边界，即使并入 CUDA macro epilogue，在当前实现里也没有端到端收益。
+- 这说明 P113/P115 的成功点仍然是长 elementwise/norm backward 链，而不是所有相邻 glue 都值得吞进去。
+- P116 不采用；当前最佳保持 P115。后续 compile 辅助 fuse 继续优先找新的长 elementwise/norm backward 链，或做 P113/P115 内部 GEMM/epilogue 优化，不继续扩大 residual epilogue。
+
+FFN 周围可 fusion 空间排查（2026-05-26）
+
+目标：回答 `node_FFN/edge_FFN` 周围是否还能继续按 compile 辅助 fuse 的思路扩大边界。
+
+新跑 profile：
+
+- `results/refine_line_profile_p115_ffn_glue_20260526/summary.json`
+- `results/refine_atom_profile_p115_ffn_glue_20260526/summary.json`
+
+候选边界归纳：
+
+| 候选 | refine_line kernel_ms | refine_atom kernel_ms | 观察 |
+| --- | ---: | ---: | --- |
+| smooth gather/multiply + target reduce | `6.161444` | `3.030900` | 有可融合空间；属于 scatter/reduce，不是 compile 最强项 |
+| node_FFN + residual half | `4.186148` | `2.718272` | FFN GEMM 占主导 |
+| edge_FFN + residual half | `7.014358` | `3.542124` | 数值较大但 GEMM 占主导 |
+| residual alone | `2.526440` | `1.536240` | 已验证单独边界负收益 |
+
+已有 compile/microbench 对照：
+
+- smooth/reduce：`results/compile_local_refine_smooth_reduce_shape_sweep_v2_20260526.json`
+  - `torch_compile` forward `0.947634x`
+  - `torch_compile` forward+backward `1.938706x`
+  - hand CUDA forward+backward `5.448204x`
+- MLP/FFN input-grad：`results/compile_local_mlp_input_grad_shape_sweep_20260526.json`
+  - compile 对 SiLU grad 小边界 `0.773667x`
+  - compile 对 full input-grad `0.790944x`
+  - 说明普通 FFN 不是好的 compile fuse 目标。
+- residual glue：`results/compile_local_residual_glue_shape_sweep_20260526.json`
+  - 单独 compile 负收益，P116 并入 CUDA epilogue后端到端也负收益。
+
+判断：
+
+- FFN 周围有继续 fuse 的空间，但不是 P113 那种纯长 elementwise/norm 链。
+- 如果后续做 refine macro，比较合理的形态是：
+
+```text
+smooth gather/multiply + target reduce
++ FFN input-grad 周围 glue
++ residual/input-grad glue
+```
+
+- GEMM 部分不要手写普通 CUDA kernel，应走 grouped GEMM / cuBLASLt / CUTLASS epilogue。
+- scatter/reduce 部分可以复用/扩展已有 `refine_line_smooth_reduce_*` CUDA op。
+- 不建议用 `torch.compile` 替代这段；compile 只能作为边界发现工具，真正收益更可能来自专用 CUDA/CUTLASS macro。
+
+refine FFN 周围大边界 compile 实验（2026-05-26）
+
+目标：用 `torch.compile(dynamic=True)` 直接验证如下 line-like refine 边界是否适合 Inductor fusion：
+
+```text
+smooth gather/multiply + target index_add
++ node_FFN / edge_FFN
++ residual add/mul
++ 对应 manual input-grad:
+   FFN input-grad
+   smooth/reduce backward
+   residual grad_old
+```
+
+新增脚本：
+
+- `test/eval/benchmark_local_compile_refine_ffn_glue.py`
+
+三种模式：
+
+| 模式 | 含义 |
+| --- | --- |
+| `torch_eager` | 纯 PyTorch baseline |
+| `torch_compile` | 同一 PyTorch 边界局部 `torch.compile(dynamic=True)` |
+| `cuda_mixed` | 现有 `refine_line_smooth_reduce_forward/backward` CUDA op + `two_linear_silu_input_grad_backward_n128` + PyTorch residual/FFN forward glue |
+
+结果文件：
+
+- smoke：`results/compile_local_refine_ffn_glue_smoke_20260526.json`
+- sweep：`results/compile_local_refine_ffn_glue_shape_sweep_20260526.json`
+- recompile 日志：`results/compile_local_refine_ffn_glue_logs_smoke_20260526.log`
+
+shape sweep 汇总：
+
+| rows | nodes | forward eager | forward compile | forward cuda_mixed | f+b eager | f+b compile | f+b cuda_mixed |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `512` | `128` | `0.197693` | `0.244040` | `0.129864` | `0.482652` | `0.316785` | `0.180675` |
+| `1024` | `256` | `0.200233` | `0.247501` | `0.130560` | `0.492196` | `0.323318` | `0.184832` |
+| `2048` | `512` | `0.195789` | `0.244040` | `0.130068` | `0.481341` | `0.321249` | `0.207278` |
+| `4096` | `1024` | `0.203162` | `0.242381` | `0.141148` | `0.485786` | `0.322744` | `0.247357` |
+| `8192` | `2048` | `0.250757` | `0.250655` | `0.195113` | `0.518451` | `0.331940` | `0.380170` |
+
+平均 speedup vs eager：
+
+| 边界 | torch_compile | cuda_mixed |
+| --- | ---: | ---: |
+| forward | `0.851998x` | `1.457155x` |
+| forward+manual backward | `1.522265x` | `2.196833x` |
+
+误差：
+
+- compile/CUDA mixed 的 max abs error 约 `1e-4` 到 `3e-3`，主要来自 GEMM/reduce 顺序差异；量级可接受。
+
+recompile 观察：
+
+- `TORCH_LOGS="graph_breaks,recompiles"` smoke 出现 recompile。
+- 原因是首个 shape 里 `num_nodes=128` 恰好等于 `dim=128`，Dynamo 生成 duck-shape guard：
+  - `base_envelope.size()[1] == base_envelope.size()[0]`
+  - `base_envelope.size()[0] == nonlinear.size()[1]`
+- 换到 `num_nodes=256` 后触发重编译。真实数据若首样本碰到这种 shape 等式，compile 缓存会受影响；后续可通过更合理 warmup shape 或 bucket/padding 缓解，但当前不值得为此改 dataloader。
+
+判断：
+
+- 这个大边界的 compile 对 forward+backward 有明确收益，说明 FFN 周围确实存在可融合 glue。
+- 但平均仍慢于现有 CUDA mixed：`1.52x` vs `2.20x`。
+- 唯一例外是大 rows `8192`：compile forward+backward `0.331940 ms` 快于 cuda_mixed `0.380170 ms`。这说明大 rows 下 GEMM/Inductor 调度可能更占优，但不足以直接替代当前 CUDA mixed。
+- 后续如果继续，应考虑“按 rows 阈值分流”：小中 rows 走 CUDA mixed / 专用 CUDA，大 rows 评估 compile 或 cuBLASLt/CUTLASS/grouped GEMM。
+- 这条 compile 结果支持 refine macro 的可行性探索，但不支持直接用 compile 替换当前手写 CUDA 路线。
+
+真实 rows 分布补充（2026-05-26）
+
+新增脚本：
+
+- `test/eval/summarize_refine_shape_distribution.py`
+
+结果文件：
+
+- `results/refine_shape_distribution_salex_limit5000_seed42_20260526.json`
+
+统计口径：
+
+- 真实 sAlex val，limit5000，sample seed 42。
+- 成功统计 `4999` 个结构；失败 `1` 个，`graph_id=219803` isolated atom。
+- 走真实 graph 构建路径：`AseAtomsAdaptor -> calculator.model.graph_converter -> process_graphs`。
+
+核心结论：
+
+| 字段 | p50 | p75 | p90 | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `atom_refine_rows` | `296` | `578` | `1042.4` | `1362` | `2174.16` | `10144` |
+| `line_refine_rows` | `1764` | `4106` | `12002.4` | `19151.6` | `32866.28` | `209088` |
+| `line_node_rows` | `148` | `289` | `521.2` | `681` | `1087.08` | `5072` |
+| `line_rows_per_node` | `12.704` | `17.322` | `24.317` | `30.559` | `40.825` | `87.398` |
+
+line refine 大 rows 占比：
+
+| threshold | count | pct |
+| --- | ---: | ---: |
+| `>=4096` | `1253` | `25.065%` |
+| `>=6144` | `921` | `18.424%` |
+| `>=8192` | `720` | `14.403%` |
+| `>=12288` | `486` | `9.722%` |
+| `>=16384` | `328` | `6.561%` |
+| `>=24576` | `148` | `2.961%` |
+
+判断：
+
+- 大 rows 主要来自 `refine_line`，不是 `refine_atom`。
+- `line_refine_rows >=8192` 有 `14.4%`，已经超过“极少数异常点”的级别，值得继续验证大 rows 分流。
+- 但中位数只有 `1764`，所以不能全量切 compile；小中 rows 仍应优先保留 CUDA mixed / 专用 CUDA。
+
+真实 shape 驱动的 compile/cuda_mixed 对照（2026-05-26）
+
+脚本更新：
+
+- `test/eval/benchmark_local_compile_refine_ffn_glue.py` 新增 `--cases rows:nodes`，可以用真实 line graph shape，而不是固定 synthetic `node_ratio=0.25`。
+
+结果文件：
+
+- `results/compile_local_refine_ffn_glue_realshape_sweep_20260526.json`
+- `results/compile_local_refine_ffn_glue_realshape_logs_smoke_20260526.log`
+
+真实 case：
+
+```text
+4096:320
+6136:382
+8192:528
+12268:483
+16388:658
+24596:514
+```
+
+forward+manual backward：
+
+| rows | nodes | eager ms | compile ms | cuda_mixed ms | compile/cuda_mixed |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| `4096` | `320` | `0.491786` | `0.324874` | `0.251515` | `0.774x` |
+| `6136` | `382` | `0.492401` | `0.330281` | `0.295506` | `0.895x` |
+| `8192` | `528` | `0.501780` | `0.325366` | `0.363909` | `1.118x` |
+| `12268` | `483` | `0.611512` | `0.363602` | `0.453140` | `1.246x` |
+| `16388` | `658` | `0.736420` | `0.417260` | `0.569795` | `1.366x` |
+| `24596` | `514` | `1.024635` | `0.538030` | `0.802673` | `1.492x` |
+
+平均 speedup vs eager：
+
+| 边界 | torch_compile | cuda_mixed |
+| --- | ---: | ---: |
+| forward | `0.997946x` | `1.327008x` |
+| forward+manual backward | `1.649661x` | `1.486486x` |
+
+日志观察：
+
+- 真实 case smoke 未发现明显 graph break / recompile。
+- 旧 recompile 来自 synthetic `num_nodes == dim == 128` 的 duck-shape guard；真实 case 中 `nodes/rows` 多为 `0.02-0.08`，没有触发同类日志。
+
+当前判断：
+
+- 真实比例推翻了旧 synthetic 的一部分判断：compile 在大 rows forward+backward 上不是只赢一次，而是从 `8192` 开始连续赢 `cuda_mixed`。
+- `4096/6136` 仍是 `cuda_mixed` 更快。
+- 真实 shape 证明大 rows 边界有价值，可以激进尝试 CUDA 扩边界；但需要用 microbench 验证是否能追上 compile。
+
+R-MACRO1/2 CUDA 扩边界尝试（2026-05-26）
+
+目标：先做非 GEMM 部分，验证旧 `cuda_mixed` 输给 compile 是否主要来自 backward glue：
+
+```text
+smooth/reduce backward
++ grad_nonlinear_direct add
++ residual input-grad:
+   grad_node_feat = grad_node_out * node_res
+   grad_edge_feat = grad_edge_out * edge_res
+```
+
+新增 op：
+
+- `matris_op.refine_line_smooth_reduce_backward_direct_residual`
+
+结果文件：
+
+- `results/compile_local_refine_ffn_glue_realshape_rmacro12_20260526.json`
+
+真实 shape forward+manual backward：
+
+| rows | nodes | compile ms | old cuda_mixed ms | R-MACRO1/2 ms | R12 vs old cuda | compile vs R12 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `4096` | `320` | `0.327844` | `0.276296` | `0.259256` | `1.066x` | `0.791x` |
+| `6136` | `382` | `0.334930` | `0.344658` | `0.324956` | `1.061x` | `0.970x` |
+| `8192` | `528` | `0.327967` | `0.355533` | `0.340173` | `1.045x` | `1.037x` |
+| `12268` | `483` | `0.363336` | `0.450970` | `0.453571` | `0.994x` | `1.248x` |
+| `16388` | `658` | `0.417014` | `0.578478` | `0.548291` | `1.055x` | `1.315x` |
+| `24596` | `514` | `0.540488` | `0.802980` | `0.761610` | `1.054x` | `1.409x` |
+
+平均 speedup vs eager：
+
+| 模式 | forward+manual backward |
+| --- | ---: |
+| `torch_compile` | `1.646572x` |
+| old `cuda_mixed` | `1.426413x` |
+| `cuda_macro_r12` | `1.493229x` |
+
+判断：
+
+- R-MACRO1/2 比 old `cuda_mixed` 稳定快一点，说明这部分 glue 融合有正收益。
+- 但它仍没有追上 compile，尤其 rows `12268+` 差距明显；因此 compile 赢大 rows 的主体不只是 `grad_nonlinear add/residual grad_old`。
+- 后续如果继续扩大 CUDA，应转向 R-MACRO3：FFN input-grad/GEMM-heavy 路线，考虑 grouped GEMM、cuBLASLt/CUTLASS epilogue，或者更深地组织 `two_linear_silu_input_grad_backward_n128 + smooth/reduce backward`。
+- R-MACRO1/2 暂不接入端到端最佳候选，仅作为 feasibility op 和后续 macro 组件保留。
+
+R-MACRO3：cuBLAS FFN input-grad feasibility（2026-05-26）
+
+目标：验证大 rows 下旧 `two_linear_silu_input_grad_backward_n128` 手写 per-row kernel 是否是主要差距。
+
+新增 op：
+
+- `matris_op.two_linear_silu_input_grad_backward_n128_cublas`
+
+实现：
+
+```text
+cuBLAS SGEMM: grad_out @ weight2
+CUDA epilogue: multiply SiLU derivative
+cuBLAS SGEMM: grad_hidden @ weight1
+```
+
+结果文件：
+
+- `results/compile_local_refine_ffn_glue_realshape_rmacro3_cublas_20260526.json`
+
+真实 shape forward+manual backward：
+
+| rows | nodes | compile ms | old cuda_mixed ms | R12 ms | cuBLAS FFN ms | cuBLAS FFN + R12 ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `4096` | `320` | `0.321577` | `0.276173` | `0.258970` | `0.261591` | `0.246661` |
+| `6136` | `382` | `0.333783` | `0.298230` | `0.278671` | `0.258929` | `0.242790` |
+| `8192` | `528` | `0.325919` | `0.357683` | `0.336609` | `0.307364` | `0.287273` |
+| `12268` | `483` | `0.364667` | `0.453837` | `0.452649` | `0.369541` | `0.348938` |
+| `16388` | `658` | `0.416072` | `0.582881` | `0.547656` | `0.445460` | `0.425472` |
+| `24596` | `514` | `0.537211` | `0.802877` | `0.766915` | `0.585708` | `0.585421` |
+
+平均 speedup vs eager：
+
+| 模式 | forward+manual backward |
+| --- | ---: |
+| `torch_compile` | `1.648061x` |
+| old `cuda_mixed` | `1.452773x` |
+| `cuda_macro_r12` | `1.530620x` |
+| `cuda_cublas_ffn` | `1.744328x` |
+| `cuda_cublas_ffn_r12` | `1.832747x` |
+
+判断：
+
+- R-MACRO3 第一版成功：cuBLAS FFN input-grad + R12 平均超过 compile。
+- 它在 rows `4096-12268` 明显强于 compile；rows `16388/24596` 略慢于 compile，但仍显著快于 old `cuda_mixed`。
+- 这说明大 rows 下主要问题确实在 FFN input-grad/GEMM-heavy 部分；R12 glue 只是小修。
+- 下一步更现实的是先做 env-gated endpoint 分流验证，而不是立刻写 CUTLASS：
+  - 小中 rows 保持当前最佳路径。
+  - refine_line large rows 尝试 `cuBLAS FFN + R12`。
+  - 阈值候选先试 `6144` 和 `8192`。
+- 如果 endpoint 有收益，再做 cuBLASLt/CUTLASS epilogue，把 `GEMM output * SiLU derivative` 合并，专门改善 rows `16388+`。
+
+R-MACRO3 endpoint 分流复核（2026-05-26）
+
+基于 microbench 结果，做了两种端到端接入：
+
+1. `refine_line` manual VJP wrapper 内接 `cuBLAS FFN + R12`。
+2. 保持 P115 默认路径，只在 P28/P29 `FusedInputMLP` input-grad 内按 rows 切换 `two_linear_silu_input_grad_backward_n128_cublas`。
+
+正确性：
+
+- 强制 threshold `0` 命中 fast path。
+- block0 / block9 correctness PASS。
+- reference candidate + 新 env PASS。
+
+端到端 limit500：
+
+| 候选 | latency_ms_mean | total | throughput | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| P115 single baseline | `75.513954` | `37.756977 s` | `13.242586/s` | 同轮参考 |
+| manual refine threshold 8192 | `90.012989` | `45.006494 s` | `11.109508/s` | 不采用 |
+| manual refine threshold 6144 | `89.982701` | `44.991350 s` | `11.113247/s` | 不采用 |
+| FFN cuBLAS threshold 8192 | `75.669576` | `37.834788 s` | `13.215351/s` | 不采用 |
+| FFN cuBLAS threshold 6144 run1 | `75.404985` | `37.702493 s` | `13.261723/s` | 噪声级 |
+| FFN cuBLAS threshold 6144 run2 | `75.531681` | `37.765840 s` | `13.239478/s` | 噪声级 |
+| FFN cuBLAS threshold 6144 run3 | `75.516130` | `37.758065 s` | `13.242204/s` | 噪声级 |
+| FFN cuBLAS threshold 6144 3-run avg | `75.484265` | - | - | 比同轮 P115 只快 `0.029689 ms` |
+
+结论：
+
+- microbench 的 `cuBLAS FFN + R12` 价值没有稳定传导到 endpoint。
+- manual refine 接入的问题是 wrapper/调度成本太大。
+- 只替换 P28/P29 FFN input-grad 的问题是收益太小，cuBLAS launch/epilogue 中间 tensor 成本吃掉了局部优势。
+- 当前最佳仍保持 P115；R-MACRO3 endpoint env 不进入最佳配置。
+- 如果继续这条线，应转为 cuBLASLt/CUTLASS epilogue 或 grouped GEMM，而不是继续简单 env 分流。
+
+refine_line 大边界 compile feasibility（2026-05-26）
+
+用户问题：
+
+- 之前 `refine_line FFN glue` 只覆盖：
+
+```text
+nonlinear
++ smooth/reduce
++ node/edge FFN input-grad
++ residual grad
+```
+
+- 现在想验证：如果再把 `edge_nonlinear_update/GatedMLP backward` 的输入梯度和 scatter 也包进来，`torch.compile` 能不能对更大的边界产生更好效果。
+
+新增脚本：
+
+- `test/eval/benchmark_local_compile_refine_full_macro.py`
+
+局部边界：
+
+```text
+smooth/reduce forward/backward
++ node_FFN / edge_FFN forward
++ node_FFN / edge_FFN input-grad
++ residual grad_old
++ GatedMLP tail backward
++ second Linear input-grad
++ pre-second SiLU grad
++ first projection input-grad
++ edge/atom/target/source scatter
+```
+
+三模式：
+
+| 模式 | 含义 |
+| --- | --- |
+| `torch_eager` | 上述大边界的 PyTorch 等价实现 |
+| `torch_compile` | `torch.compile(torch_eager_boundary, dynamic=True)` |
+| `cuda_mixed_current_ops` | 当前已有 CUDA 小块拼接：smooth/reduce op + FFN input-grad op + GatedMLP second-tail macro + project/scatter op |
+| `cuda_mixed_cublas_ffn` | 同上，但 FFN input-grad 用 cuBLAS 版本 |
+
+结果文件：
+
+- `results/compile_local_refine_full_macro_realshape_20260526.json`
+- `results/compile_local_refine_full_macro_logs_smoke_20260526.json`
+- `results/compile_local_refine_full_macro_logs_smoke_20260526.log`
+
+真实 shape：
+
+```text
+4096:320
+6136:382
+8192:528
+12268:483
+16388:658
+24596:514
+```
+
+forward + manual backward 大边界：
+
+| rows | nodes | eager ms | compile ms | cuda current ms | cuda cuBLAS-FFN ms | 结论 |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `4096` | `320` | `1.132902` | `0.437965` | `0.526797` | `0.511744` | compile 快 |
+| `6136` | `382` | `1.182618` | `0.492954` | `0.678195` | `0.632730` | compile 快 |
+| `8192` | `528` | `1.196339` | `0.567296` | `0.831590` | `0.774093` | compile 快 |
+| `12268` | `483` | `1.481114` | `0.708147` | `1.130189` | `1.049088` | compile 快 |
+| `16388` | `658` | `1.841254` | `0.840397` | `1.460685` | `1.347738` | compile 快 |
+| `24596` | `514` | `2.633882` | `1.160448` | `2.088090` | `1.917747` | compile 快 |
+
+汇总：
+
+| 模式 | weighted mean ms | 平均 speedup vs eager |
+| --- | ---: | ---: |
+| `torch_eager` | `1.881035` | `1.000x` |
+| `torch_compile` | `0.843634` | `2.274469x` |
+| `cuda_mixed_current_ops` | `1.427159` | `1.527561x` |
+| `cuda_mixed_cublas_ffn` | `1.317676` | `1.629962x` |
+
+日志：
+
+- `TORCH_LOGS="graph_breaks,recompiles"` smoke 覆盖 `4096:320,8192:528,12268:483`。
+- 未搜到明显 `graph break` / `recompile` 关键词。
+- 说明该局部函数在这些真实形状上可以被 `dynamic=True` 稳定覆盖。
+
+数值：
+
+- compile / CUDA 路径相对 eager 的误差同量级。
+- 最大 abs error 随 rows 增大到 `O(1e-1)`，mean abs 多数在 `1e-3 ~ 1e-2`。
+- 主要来自大 rows 下 `index_add/scatter atomic` 累加顺序和 GEMM 计算顺序差异；作为 feasibility microbench 可接受。
+- 如果要接端到端，需要再用 block0/block9 correctness 和最终 MAE 验证。
+
+当前判断：
+
+- 这次“大边界”结果比小边界更有价值：`torch_compile` 不只是追平，而是在所有测试真实大 rows 上都超过当前 CUDA 小块拼接。
+- 这说明之前 CUDA 小块虽然各自快，但边界之间仍有明显 glue / materialize / scatter 调度成本。
+- 但这还不是端到端收益：当前模型里已经有多处自定义 CUDA op，`torch.compile` 不能自然跨这些黑盒 op 接入；如果直接套进模型，可能遇到调用边界、autograd wrapper 和动态图调度成本。
+- 更合理的下一步不是马上用 compile 替换端到端路径，而是把这个 compile 成功边界当作 CUDA macro 设计参考。
+
+后续建议：
+
+1. 先用 profiler 确认 P115 当前 endpoint 里这个大边界对应 kernel 是否仍是 top hotspot。
+2. 如果是，做 `refine_line_full_backward_macro` CUDA/C++ wrapper，避免 Python manual VJP wrapper 开销。
+3. wrapper 内部不要写成一个超大手写 kernel：
+   - smooth/reduce/scatter 用专用 CUDA。
+   - FFN/GatedMLP GEMM 用 cuBLASLt/CUTLASS/grouped GEMM。
+   - residual/add/mul 和 SiLU/LN backward epilogue 尽量并入相邻 kernel。
+4. 再做 block0/block9 correctness。
+5. 最后只用端到端 limit500 / limit5000 判断是否进入最佳候选。
+
+根据大边界 compile 写 CUDA macro（2026-05-26）
+
+目标：
+
+- 参考 `refine_line 大边界 compile feasibility` 的成功边界，写一个对应的 CUDA/C++ op。
+- 先验证：把 Python 侧多个 CUDA op / PyTorch op 拼接搬到 C++ extension 内，能不能接近或超过 compile。
+
+新增/修改：
+
+- C++ wrapper：
+  - `matris_op.refine_line_full_backward_macro`
+  - 文件：`matris/model/op/src/cpp/refine_line_full_backward_macro.cpp`
+- 实验性 scatter-add CUDA op：
+  - `matris_op.refine_line_project_dual_grad_scatter_add_tile32`
+  - 文件：`matris/model/op/src/kernel/line_edge_first_projection.cu`
+- benchmark 增加对照：
+  - `cuda_full_macro_wrapper`
+  - `cuda_full_macro_wrapper_cublas_ffn`
+
+v1 CUDA macro wrapper 边界：
+
+```text
+refine_line_smooth_reduce_forward
++ ATen linear/silu/linear FFN forward
++ two_linear_silu_input_grad_backward_n128 或 cuBLAS FFN input-grad
++ refine_line_smooth_reduce_backward_direct_residual
++ gated_tail_second_silu_input_grad_macro
++ torch cat([grad_core, grad_gate])
++ refine_line_project_grad_scatter_backward_tile32
++ grad_node / grad_edge add
+```
+
+结果文件：
+
+- `results/compile_local_refine_full_macro_cuda_wrapper_realshape_20260526.json`
+
+真实 shape forward + manual backward：
+
+| rows | compile ms | cuda mixed ms | cuda mixed cuBLAS ms | wrapper ms | wrapper cuBLAS ms |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| `4096` | `0.499968` | `0.623514` | `0.609997` | `0.619264` | `0.604621` |
+| `6136` | `0.567040` | `0.806093` | `0.710810` | `0.665549` | `0.625357` |
+| `8192` | `0.570419` | `0.828416` | `0.774298` | `0.822374` | `0.769024` |
+| `12268` | `0.715213` | `1.131674` | `1.049498` | `1.127782` | `1.044429` |
+| `16388` | `0.843418` | `1.453414` | `1.349530` | `1.456896` | `1.341850` |
+| `24596` | `1.159936` | `2.107802` | `1.920256` | `2.101453` | `1.914368` |
+
+汇总：
+
+| 模式 | weighted mean ms | 平均 speedup vs eager |
+| --- | ---: | ---: |
+| `torch_compile` | `0.855601` | `2.201493x` |
+| `cuda_mixed_current_ops` | `1.448629` | `1.454738x` |
+| `cuda_mixed_cublas_ffn` | `1.331339` | `1.566633x` |
+| `cuda_full_macro_wrapper` | `1.433615` | `1.513091x` |
+| `cuda_full_macro_wrapper_cublas_ffn` | `1.318470` | `1.613722x` |
+
+v1 判断：
+
+- C++ wrapper 相比 Python 拼接有小幅收益，尤其 `6136` rows 明显改善。
+- 但整体仍远慢于 `torch_compile`。
+- 说明真正差距不是 Python 调用边界本身，而是 wrapper 内部仍存在：
+  - `cat([grad_core, grad_gate])` 物化。
+  - project/scatter 中间 tensor。
+  - final `grad_node + scatter_grad_node` / `grad_edge + scatter_grad_edge`。
+  - 多个 GEMM/epilogue 独立 launch 和中间 tensor。
+
+v2 尝试：
+
+- 新增 `refine_line_project_dual_grad_scatter_add_tile32`：
+  - 直接接收 `grad_core_first` / `grad_gate_first` 两路。
+  - 在 projection kernel 内分别乘 `first_weight[:128]` 和 `first_weight[128:]`。
+  - 直接 scatter-add 到已有 `grad_node/grad_edge`，试图去掉 `cat + scatter tensor + final add`。
+
+结果文件：
+
+- `results/compile_local_refine_full_macro_cuda_wrapper_v2_realshape_20260526.json`
+
+汇总：
+
+| 模式 | weighted mean ms | 平均 speedup vs eager |
+| --- | ---: | ---: |
+| `torch_compile` | `0.852408` | `2.232032x` |
+| `cuda_mixed_current_ops` | `1.445323` | `1.482928x` |
+| `cuda_mixed_cublas_ffn` | `1.326183` | `1.589447x` |
+| `cuda_full_macro_wrapper` v2 | `1.670359` | `1.360396x` |
+| `cuda_full_macro_wrapper_cublas_ffn` v2 | `1.551636` | `1.440291x` |
+
+v2 判断：
+
+- v2 在小 rows smoke 中更快，但真实大 rows 明显变慢。
+- 原因推断：direct scatter-add kernel 做了更多 per-col/per-row projection 工作，访存和原子写压力更高；它省掉了 `cat/add`，但 project/scatter kernel 本身变差，得不偿失。
+- 因此 full wrapper 默认已恢复为 v1 路线；v2 op 只保留为实验件，不作为当前候选。
+
+本轮结论：
+
+- 已经按大边界 compile 写了对应 CUDA/C++ macro，并完成 microbench。
+- 简单 C++ macro wrapper 只能小幅优于旧 CUDA 拼接，不能接近 compile。
+- 尝试把 scatter-add 再融合进 project kernel 反而在真实大 rows 变慢。
+- 这条线如果继续，不能再靠“简单包大边界”，需要更底层优化：
+  - 用 cuBLASLt/CUTLASS epilogue 合并 `GEMM output * SiLU derivative`。
+  - 或重写 project/scatter，使其避免当前 tile32 的重复读 weight/重复原子。
+  - 或做 grouped GEMM，把 node/edge FFN input-grad、GatedMLP core/gate second input-grad 组织成更少 launch。
+- 当前不建议接入端到端；P115 仍保持最佳候选。
+
+grouped GEMM 进一步试探（2026-05-26）
+
+目标：
+
+- 继续验证“更底层优化 GEMM/epilogue”中的 grouped GEMM 路线。
+- 先把 `two_linear_silu_input_grad_backward_n128_cublas` 改成 grouped pair 版本，再塞回 refine_line 大边界 wrapper 对照。
+
+新增：
+
+- `matris_op.two_linear_silu_input_grad_backward_n128_cublas_grouped_pair`
+- benchmark 对照：`cuda_full_macro_grouped_ffn`
+
+实现：
+
+- 两个 128x128 FFN input-grad 一次 `cublasSgemmGroupedBatched` 调度。
+- SiLU derivative 仍用单独小 CUDA kernel。
+- 其它 refine_line glue 保持不变。
+
+结果文件：
+
+- `results/compile_local_refine_full_macro_grouped_smoke_20260526.json`
+- `results/compile_local_refine_full_macro_grouped_realshape_20260526.json`
+
+真实 shape 汇总：
+
+| 模式 | weighted mean ms | 平均 speedup vs eager |
+| --- | ---: | ---: |
+| `torch_compile` | `0.855845` | `2.190170x` |
+| `cuda_mixed_current_ops` | `1.446797` | `1.444151x` |
+| `cuda_mixed_cublas_ffn` | `1.336517` | `1.533242x` |
+| `cuda_full_macro_wrapper` | `1.428469` | `1.505625x` |
+| `cuda_full_macro_wrapper_cublas_ffn` | `1.319765` | `1.602455x` |
+| `cuda_full_macro_grouped_ffn` | `1.345890` | `1.521803x` |
+
+判断：
+
+- grouped GEMM 比 `cuda_mixed_current_ops` 和普通 wrapper 略好一点，但不如 `cuda_mixed_cublas_ffn`。
+- 和 `torch_compile` 仍差很远。
+- 说明 grouped GEMM 不是当前主瓶颈，只是一个小修。
+- 后续如果继续，只值得往这两条走：
+  1. cuBLASLt/CUTLASS epilogue，把 `grad_hidden * silu_grad` 合并进 GEMM 输出处理。
+  2. 重写 project/scatter，减少原子压力和重复读 weight。
+- 暂不把 grouped GEMM 作为独立主线。
+
+refine_line 大边界 compile 端到端接入（2026-05-26）
+
+目标：
+
+- 把 microbench 中最快的 `refine_line` 大边界 `torch.compile(dynamic=True)` 尝试接入真实端到端路径。
+- 只做局部 compile，不做 `torch.compile(model)`。
+- 保留当前 P115 CUDA fused 最佳路径；新增 env-gated 实验开关。
+
+新增开关：
+
+- `MATRIS_COMPILE_REFINE_LINE_FULL_BACKWARD=1`
+- `MATRIS_COMPILE_REFINE_LINE_ROWS_THRESHOLD=4096|8192`
+- `MATRIS_COMPILE_REFINE_LINE_MODE=default`
+
+接入方式：
+
+- 在 `refine_line` manual VJP backward 内加入局部 compiled PyTorch 等价函数。
+- 覆盖边界：
+  - `smooth = nonlinear * base_i * base_j`
+  - target `index_add` reduce
+  - node/edge FFN forward + input-grad
+  - residual input-grad
+  - GatedMLP second-tail projected grad
+  - first projection + edge/atom/node scatter
+- forward 仍复用当前 manual VJP cache，不影响默认 P115 路径。
+
+correctness：
+
+| block | limit | result | worst max_abs |
+| --- | ---: | --- | ---: |
+| block0 | 2 | PASS | `8.58306884765625e-06` |
+| block9 | 2 | PASS | `2.6226043701171875e-06` |
+
+结果文件：
+
+- `results/refine_line_compile_full_correctness_block0_smoke.json`
+- `results/refine_line_compile_full_correctness_block9_smoke.json`
+- `results/p117_compile_refine_line_full_limit500/eval/summary.json`
+- `results/p117_compile_refine_line_full_thr8192_warm20_limit500/eval/summary.json`
+
+端到端 limit500：
+
+| 候选 | threshold | warmup excluded | latency_ms_mean | total | throughput | 成功 | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| compile full backward | 4096 | 0 | `87.750487` | `43.875243 s` | `11.395948/s` | `500/500` | 首次 compile 编译时间进入统计，明显慢 |
+| compile full backward | 8192 | 20 | `74.544084` | `35.781160 s` | `13.414881/s` | `500/500` timed | 排除 warmup 后仍慢于 P115 |
+
+对比：
+
+- 当前 P115 limit500：`73.482076 ms`。
+- `threshold=8192 + warmup20` 仍慢 `1.062008 ms`。
+
+判断：
+
+- 局部 microbench 中 `torch_compile` 很强，但端到端接入需要启用 `refine_line` manual VJP wrapper，调度/cache/动态图成本会吃掉局部收益。
+- 真实端到端不支持把这段直接替换为 compile 作为最佳候选。
+- 当前最佳仍保持 P115 all node + atom edge second-tail CUDA macro。
+- compile 结果仍有设计参考价值：说明大边界本身有 fusion 空间，但要转化为 endpoint 收益，需要继续写更底层 CUDA/CUTLASS/cuBLASLt macro，而不是把局部 compile 直接塞进模型。
+
+refine_line 正常 forward 局部 compile 接入（2026-05-26）
+
+目标：
+
+- 不走 `P104` manual VJP。
+- 保留当前已有 CUDA fused op。
+- 只把 `refine_line` 正常模块 forward 包成局部 `torch.compile(dynamic=True)`，观察能否靠 compile 融合 CUDA op 之间的 PyTorch glue。
+
+新增开关：
+
+- `MATRIS_COMPILE_REFINE_LINE_FORWARD=1`
+- `MATRIS_COMPILE_REFINE_LINE_FORWARD_ROWS_THRESHOLD=0|8192`
+- `MATRIS_COMPILE_REFINE_LINE_FORWARD_MODE=default`
+
+实现：
+
+- 在 `Interaction_Block.wrapper_refine_layer` 中对 line graph refine 调用加 env-gated compile 包装。
+- 不启用 `MATRIS_P104_REFINE_LINE_R3_BLOCK_VJP`。
+- 不关闭 P105/P106/P108/P113/P114/P115 等已有 CUDA op。
+
+smoke 结果：
+
+| 配置 | limit | warmup excluded | latency_ms_mean | total | throughput | 成功 | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| compile refine_line forward all rows | 20 | 5 | `78.737428` | `1.181061 s` | `12.700440/s` | `20/20` | 慢，且出现 recompile limit |
+| compile refine_line forward rows>=8192 | 20 | 5 | `75.196740` | `1.127951 s` | `13.298449/s` | `20/20` | 仍慢于 P115 附近水平 |
+
+结果文件：
+
+- `results/p118_compile_refine_line_forward_smoke20/eval/summary.json`
+- `results/p118_compile_refine_line_forward_thr8192_smoke20/eval/summary.json`
+
+Dynamo 诊断：
+
+- 自定义 CUDA op 被 Dynamo 视为黑盒：
+  - `matris_op.PyCapsule.gated_tail_second_silu_input_grad_macro`
+  - `matris_op.PyCapsule.two_linear_silu_input_grad_backward_n128`
+- all-rows 版本触发 recompile limit，原因之一是：
+  - `self.profile_prefix == 'interaction_block.7.refine_line'`
+- 固定 `profile_prefix` 后，rows>=8192 版本仍在内部 GatedMLP 路径触发 recompile limit，原因之一是：
+  - `self.module_name == 'interaction_block.7.refine_block_line_graph.edge_nonlinear_update'`
+
+判断：
+
+- 这条路线验证了之前的担心：当前已有 CUDA fused op 对 `torch.compile` 是黑盒，compile 只能处理黑盒之间剩余的小 glue。
+- 直接“保留 CUDA op + 外层包 compile refine_line forward”不适合作为端到端优化方向。
+- 不继续跑 limit500；当前最佳仍保持 P115。
+- 如果后续还想用 compile，应该回到“局部 PyTorch baseline microbench 发现边界 -> 写 CUDA/CUTLASS macro”的模式，而不是在已有 CUDA fused 路径外层套 compile。

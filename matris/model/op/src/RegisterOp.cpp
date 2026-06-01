@@ -42,6 +42,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           &fused_line_attention_node_input_forward_target_offsets,
           "P83C fused_line_attention_node_input_forward_target_offsets");
     m.def("fused_line_attention_backward", &fused_line_attention_backward, "fused_line_attention_backward");
+    m.def("fused_line_attention_backward_with_edge_direct",
+          &fused_line_attention_backward_with_edge_direct,
+          "P106 fused_line_attention_backward with direct edge grad accumulation");
+    m.def("fused_line_attention_values_backward_with_edge_direct",
+          &fused_line_attention_values_backward_with_edge_direct,
+          "P107 fused_line_attention values-only backward with direct edge grad accumulation");
     m.def("line_edge_gather_cat_forward", &line_edge_gather_cat_forward, "line_edge_gather_cat_forward");
     m.def("line_edge_cat_grad_scatter_backward", &line_edge_cat_grad_scatter_backward, "line_edge_cat_grad_scatter_backward");
     m.def("line_node_triple_cat_forward",
@@ -54,6 +60,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("directed_edge_cat_grad_scatter_backward",
           &directed_edge_cat_grad_scatter_backward,
           "directed_edge_cat_grad_scatter_backward");
+    m.def("directed_edge_silu_project_grad_scatter_backward_tile32",
+          &directed_edge_silu_project_grad_scatter_backward_tile32,
+          "AT-CUDA1B directed edge fused SiLU/project/scatter backward");
     m.def("refine_line_edge_gather_cat_forward",
           &refine_line_edge_gather_cat_forward,
           "refine_line_edge_gather_cat_forward");
@@ -63,6 +72,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("refine_line_project_grad_scatter_backward_tile32",
           &refine_line_project_grad_scatter_backward_tile32,
           "refine_line_project_grad_scatter_backward_tile32");
+    m.def("refine_line_project_dual_grad_scatter_add_tile32",
+          &refine_line_project_dual_grad_scatter_add_tile32,
+          "refine_line project dual core/gate grad scatter-add into existing grads");
     m.def("refine_line_first_silu_forward",
           &refine_line_first_silu_forward,
           "P60 refine-line fused first projection + SiLU forward");
@@ -93,6 +105,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("refine_line_smooth_reduce_backward",
           &refine_line_smooth_reduce_backward,
           "refine_line_smooth_reduce_backward");
+    m.def("refine_line_smooth_reduce_sorted_forward",
+          &refine_line_smooth_reduce_sorted_forward,
+          "refine_line_smooth_reduce_sorted_forward");
+    m.def("refine_line_smooth_reduce_sorted_backward",
+          &refine_line_smooth_reduce_sorted_backward,
+          "refine_line_smooth_reduce_sorted_backward");
     m.def("refine_line_edge_smooth_w8a8_backward_n128",
           &refine_line_edge_smooth_w8a8_backward_n128,
           "P64 refine-line smooth reduce + W8A8 tail + first projection fused backward");
@@ -120,6 +138,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("line_edge_silu_project_alpha_grad_scatter_backward_tile32",
           &line_edge_silu_project_alpha_grad_scatter_backward_tile32,
           "line_edge_silu_project_alpha_grad_scatter_backward_tile32");
+    m.def("line_edge_silu_project_alpha_grad_scatter_backward_alpha_tile32",
+          &line_edge_silu_project_alpha_grad_scatter_backward_alpha_tile32,
+          "P108 line_edge_silu_project_alpha_grad_scatter_backward alpha-tiled");
+    m.def("line_edge_silu_project_alpha_grad_scatter_backward_dense_gemm",
+          &line_edge_silu_project_alpha_grad_scatter_backward_dense_gemm,
+          "P108 line_edge_silu_project_alpha_grad_scatter_backward dense-gemm");
+    m.def("line_edge_silu_project_alpha_grad_scatter_backward_target_reduce_tile32",
+          &line_edge_silu_project_alpha_grad_scatter_backward_target_reduce_tile32,
+          "P108 line_edge_silu_project_alpha_grad_scatter_backward target-reduce");
+    m.def("line_edge_silu_project_alpha_attention_grad_scatter_backward_tile32",
+          &line_edge_silu_project_alpha_attention_grad_scatter_backward_tile32,
+          "P107 line-edge fused first projection + attention alpha projection input grad + scatter");
     m.def("line_edge_w8a8_tail_project_scatter_backward_n128",
           &line_edge_w8a8_tail_project_scatter_backward_n128,
           "line_edge_w8a8_tail_project_scatter_backward_n128");
@@ -127,6 +157,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("input_grad_only_gated_tail_backward_n128_v2",
           &input_grad_only_gated_tail_backward_n128_v2,
           "P89B input_grad_only_gated_tail_backward_n128_v2");
+    m.def("gated_tail_second_silu_input_grad_macro",
+          &gated_tail_second_silu_input_grad_macro,
+          "GatedMLP tail backward + second Linear input-grad + pre-second SiLU grad macro");
+    m.def("gated_tail_second_silu_residual_input_grad_macro",
+          &gated_tail_second_silu_residual_input_grad_macro,
+          "GatedMLP second-tail macro plus residual input/res-weight grad");
     m.def("input_grad_only_gated_tail_backward_stack",
           &input_grad_only_gated_tail_backward_stack,
           "input_grad_only_gated_tail_backward_stack");
@@ -199,16 +235,24 @@ TORCH_LIBRARY(matris_op, m)
     m.def("fused_line_attention_node_input_forward_target_offsets",
           &fused_line_attention_node_input_forward_target_offsets);
     m.def("fused_line_attention_backward", &fused_line_attention_backward);
+    m.def("fused_line_attention_backward_with_edge_direct",
+          &fused_line_attention_backward_with_edge_direct);
+    m.def("fused_line_attention_values_backward_with_edge_direct",
+          &fused_line_attention_values_backward_with_edge_direct);
     m.def("line_edge_gather_cat_forward", &line_edge_gather_cat_forward);
     m.def("line_edge_cat_grad_scatter_backward", &line_edge_cat_grad_scatter_backward);
     m.def("line_node_triple_cat_forward", &line_node_triple_cat_forward);
     m.def("line_node_triple_cat_backward", &line_node_triple_cat_backward);
     m.def("directed_edge_gather_cat_forward", &directed_edge_gather_cat_forward);
     m.def("directed_edge_cat_grad_scatter_backward", &directed_edge_cat_grad_scatter_backward);
+    m.def("directed_edge_silu_project_grad_scatter_backward_tile32",
+          &directed_edge_silu_project_grad_scatter_backward_tile32);
     m.def("refine_line_edge_gather_cat_forward", &refine_line_edge_gather_cat_forward);
     m.def("refine_line_edge_cat_grad_scatter_backward", &refine_line_edge_cat_grad_scatter_backward);
     m.def("refine_line_project_grad_scatter_backward_tile32",
           &refine_line_project_grad_scatter_backward_tile32);
+    m.def("refine_line_project_dual_grad_scatter_add_tile32",
+          &refine_line_project_dual_grad_scatter_add_tile32);
     m.def("refine_line_first_silu_forward", &refine_line_first_silu_forward);
     m.def("refine_line_first_silu_forward_acts", &refine_line_first_silu_forward_acts);
     m.def("refine_line_first_tail_w8a8_forward", &refine_line_first_tail_w8a8_forward);
@@ -220,6 +264,8 @@ TORCH_LIBRARY(matris_op, m)
     m.def("refine_line_first_silu_backward_packed", &refine_line_first_silu_backward_packed);
     m.def("refine_line_smooth_reduce_forward", &refine_line_smooth_reduce_forward);
     m.def("refine_line_smooth_reduce_backward", &refine_line_smooth_reduce_backward);
+    m.def("refine_line_smooth_reduce_sorted_forward", &refine_line_smooth_reduce_sorted_forward);
+    m.def("refine_line_smooth_reduce_sorted_backward", &refine_line_smooth_reduce_sorted_backward);
     m.def("refine_line_edge_smooth_w8a8_backward_n128",
           &refine_line_edge_smooth_w8a8_backward_n128);
     m.def("refine_line_smooth_w8a8_tail_input_grad_backward_n128",
@@ -235,10 +281,21 @@ TORCH_LIBRARY(matris_op, m)
           &line_edge_silu_project_grad_scatter_backward_tile32);
     m.def("line_edge_silu_project_alpha_grad_scatter_backward_tile32",
           &line_edge_silu_project_alpha_grad_scatter_backward_tile32);
+    m.def("line_edge_silu_project_alpha_grad_scatter_backward_alpha_tile32",
+          &line_edge_silu_project_alpha_grad_scatter_backward_alpha_tile32);
+    m.def("line_edge_silu_project_alpha_grad_scatter_backward_dense_gemm",
+          &line_edge_silu_project_alpha_grad_scatter_backward_dense_gemm);
+    m.def("line_edge_silu_project_alpha_grad_scatter_backward_target_reduce_tile32",
+          &line_edge_silu_project_alpha_grad_scatter_backward_target_reduce_tile32);
+    m.def("line_edge_silu_project_alpha_attention_grad_scatter_backward_tile32",
+          &line_edge_silu_project_alpha_attention_grad_scatter_backward_tile32);
     m.def("line_edge_w8a8_tail_project_scatter_backward_n128",
           &line_edge_w8a8_tail_project_scatter_backward_n128);
     m.def("input_grad_only_gated_tail_backward", &input_grad_only_gated_tail_backward);
     m.def("input_grad_only_gated_tail_backward_n128_v2", &input_grad_only_gated_tail_backward_n128_v2);
+    m.def("gated_tail_second_silu_input_grad_macro", &gated_tail_second_silu_input_grad_macro);
+    m.def("gated_tail_second_silu_residual_input_grad_macro",
+          &gated_tail_second_silu_residual_input_grad_macro);
     m.def("input_grad_only_gated_tail_backward_stack", &input_grad_only_gated_tail_backward_stack);
     m.def("param_grad_gated_tail_backward", &param_grad_gated_tail_backward);
     m.def("w8a8_dual_gated_tail_input_grad_backward_n128", &w8a8_dual_gated_tail_input_grad_backward_n128);

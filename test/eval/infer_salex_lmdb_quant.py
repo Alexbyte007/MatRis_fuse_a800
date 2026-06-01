@@ -71,6 +71,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-batch-atoms",
+        type=int,
+        default=0,
+        help=(
+            "Optional safety cap for batched inference. When >0, batch-size is "
+            "treated as the maximum number of structures and batches are split "
+            "early before the total atom count would exceed this value."
+        ),
+    )
+    parser.add_argument(
         "--prefetch-graphs",
         action="store_true",
         help=(
@@ -334,6 +344,11 @@ def main() -> None:
     n_atoms = []
     predictions = []
     latencies_ms = []
+    batch_stats = {
+        "num_batches": 0,
+        "max_structures_per_batch": 0,
+        "max_atoms_per_batch": 0,
+    }
 
     pred_fp = None
     if args.save_predictions:
@@ -378,6 +393,51 @@ def main() -> None:
                 record["latency_ms"] = per_structure_latency_ms
             predictions.append(record)
             pred_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def run_atoms_batch(batch_atoms: list, batch_meta: list[dict]) -> None:
+        if not batch_atoms:
+            return
+
+        batch_stats["num_batches"] += 1
+        batch_stats["max_structures_per_batch"] = max(
+            batch_stats["max_structures_per_batch"],
+            len(batch_atoms),
+        )
+        batch_stats["max_atoms_per_batch"] = max(
+            batch_stats["max_atoms_per_batch"],
+            sum(len(atom) for atom in batch_atoms),
+        )
+
+        try:
+            sync_if_needed(args.device)
+            start = time.perf_counter()
+            with autocast_context(args.device, args.precision_mode):
+                batch_results = calculator.calculate_many(batch_atoms)
+            sync_if_needed(args.device)
+            per_latency = None
+            if args.measure_time:
+                per_latency = (time.perf_counter() - start) * 1000.0 / max(1, len(batch_results))
+
+            for atom, meta, result in zip(batch_atoms, batch_meta, batch_results):
+                append_record(
+                    meta["idx"],
+                    meta["graph_id"],
+                    atom,
+                    meta["energy_label"],
+                    float(result["energy"]),
+                    meta["label_force"],
+                    result["forces"],
+                    meta["label_stress"],
+                    (
+                        full_3x3_to_voigt_6_stress(result["stress"])
+                        if result["stress"] is not None and np.asarray(result["stress"]).shape == (3, 3)
+                        else result["stress"]
+                    ),
+                    per_latency,
+                )
+        except Exception as exc:
+            graph_id_text = ",".join(str(meta["graph_id"]) for meta in batch_meta)
+            print(f"处理 batch (graph_id: {graph_id_text}) 时出错: {exc}")
 
     try:
         if args.prefetch_graphs and args.batch_size <= 1:
@@ -482,55 +542,49 @@ def main() -> None:
                     print(f"处理索引 {idx} (graph_id: {graph_id_text}) 时出错: {exc}")
                     continue
         else:
-            for batch_start in tqdm(range(0, len(keys), args.batch_size)):
-                batch_indices = list(range(batch_start, min(batch_start + args.batch_size, len(keys))))
+            pending_atoms = []
+            pending_meta = []
+            pending_natoms = 0
+
+            for idx in tqdm(range(len(keys))):
                 try:
-                    batch_atoms = []
-                    batch_meta = []
-                    for idx in batch_indices:
-                        graph_id = int(keys[idx])
-                        atom = structures.get_atoms(graph_id)
-                        batch_atoms.append(atom)
-                        batch_meta.append(
-                            {
-                                "idx": idx,
-                                "graph_id": graph_id,
-                                "energy_label": atom.get_potential_energy(),
-                                "label_force": atom.get_forces(),
-                                "label_stress": atom.get_stress(),
-                            }
-                        )
+                    graph_id = int(keys[idx])
+                    atom = structures.get_atoms(graph_id)
+                    atom_n = len(atom)
 
-                    sync_if_needed(args.device)
-                    start = time.perf_counter()
-                    with autocast_context(args.device, args.precision_mode):
-                        batch_results = calculator.calculate_many(batch_atoms)
-                    sync_if_needed(args.device)
-                    per_latency = None
-                    if args.measure_time:
-                        per_latency = (time.perf_counter() - start) * 1000.0 / max(1, len(batch_results))
+                    if (
+                        pending_atoms
+                        and args.max_batch_atoms > 0
+                        and pending_natoms + atom_n > args.max_batch_atoms
+                    ):
+                        run_atoms_batch(pending_atoms, pending_meta)
+                        pending_atoms = []
+                        pending_meta = []
+                        pending_natoms = 0
 
-                    for atom, meta, result in zip(batch_atoms, batch_meta, batch_results):
-                        append_record(
-                            meta["idx"],
-                            meta["graph_id"],
-                            atom,
-                            meta["energy_label"],
-                            float(result["energy"]),
-                            meta["label_force"],
-                            result["forces"],
-                            meta["label_stress"],
-                            (
-                                full_3x3_to_voigt_6_stress(result["stress"])
-                                if result["stress"] is not None and np.asarray(result["stress"]).shape == (3, 3)
-                                else result["stress"]
-                            ),
-                            per_latency,
-                        )
+                    pending_atoms.append(atom)
+                    pending_meta.append(
+                        {
+                            "idx": idx,
+                            "graph_id": graph_id,
+                            "energy_label": atom.get_potential_energy(),
+                            "label_force": atom.get_forces(),
+                            "label_stress": atom.get_stress(),
+                        }
+                    )
+                    pending_natoms += atom_n
+
+                    if len(pending_atoms) >= args.batch_size:
+                        run_atoms_batch(pending_atoms, pending_meta)
+                        pending_atoms = []
+                        pending_meta = []
+                        pending_natoms = 0
                 except Exception as exc:
-                    graph_id_text = ",".join(str(int(keys[idx])) for idx in batch_indices)
-                    print(f"处理 batch_start {batch_start} (graph_id: {graph_id_text}) 时出错: {exc}")
+                    graph_id_text = locals().get("graph_id", "unknown")
+                    print(f"处理索引 {idx} (graph_id: {graph_id_text}) 时出错: {exc}")
                     continue
+
+            run_atoms_batch(pending_atoms, pending_meta)
     finally:
         if pred_fp is not None:
             pred_fp.close()
@@ -555,6 +609,8 @@ def main() -> None:
         "quant_mode": args.quant_mode,
         "fusion_mode": args.fusion_mode,
         "batch_size": args.batch_size,
+        "max_batch_atoms": args.max_batch_atoms,
+        "batch_stats": batch_stats,
         "prefetch_graphs": args.prefetch_graphs,
         "quant_config": getattr(calculator, "quant_config", None),
         "quant_replaced_modules": getattr(calculator, "quant_replaced_modules", []),

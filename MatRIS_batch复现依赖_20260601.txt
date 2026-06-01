@@ -1,0 +1,57 @@
+MatRIS Batch 优化复现依赖记录
+
+更新时间：2026-06-01
+
+本文件记录 `p115-batch128-20260601` / 后续完整优化 tag 的外部依赖。模型权重和数据集不直接纳入普通 Git commit，原因是它们属于大二进制文件，适合用 Git LFS、Release assets、DVC、对象存储或共享文件系统管理。
+
+代码版本
+
+- 分支：`batch-disjoint-graph-20260601`
+- 初始 batch tag：`p115-batch128-20260601`
+- 完整优化 tag：见本次提交后新 tag
+
+数据集
+
+- 数据集：sAlex validation split
+- 本地路径：`/home/lht/lab/sAlex/val`
+- 当前大小：约 `981M`
+- endpoint 参数：
+
+```bash
+--dataset-src /home/lht/lab/sAlex/val
+--limit 500
+--sample-seed 42
+```
+
+模型权重
+
+- 模型：`matris_10m_oam`
+- 本地缓存权重：`/home/lht/.cache/matris/MatRIS_10M_OAM.pth.tar`
+- 当前大小：约 `42M`
+- endpoint 参数：
+
+```bash
+--model matris_10m_oam
+```
+
+环境提示
+
+- 已验证主环境：`/home/lht/miniconda3/envs/matris311`
+- CUDA ops 需要在目标环境中重新编译/安装。
+- batch/NV 构图实验环境：`matris_nv28`，用于 `nvalchemi-toolkit-ops` 和 `warp-lang` 实验。
+
+复现主命令
+
+参考 `MatRIS_batch优化任务清单.txt` 中的 P115 batch=128 limit500 命令。
+
+重要说明
+
+普通 Git tag 只固定代码和文本清单，不固定外部数据集、模型权重和本机 CUDA 编译产物。若需要完全离线可复现包，建议另建 release artifact：
+
+```text
+代码 tag
++ 模型权重文件
++ 数据集归档或下载说明
++ conda 环境导出文件
++ 自定义 CUDA ops 编译说明
+```

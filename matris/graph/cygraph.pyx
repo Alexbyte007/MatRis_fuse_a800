@@ -172,3 +172,58 @@ def make_graph(
     free(returned)
     
     return py_nodes, py_directed_edges_list, py_undirected_edges_list, py_undirected_edges
+
+
+def line_graph_adjacency_list_fast(nodes, undirected_edges_list, double cutoff):
+    """Build the MatRIS line graph using the same ordering as Graph.line_graph_adjacency_list.
+
+    This keeps the existing Python graph object model intact, but moves the
+    deeply nested loop out of Python bytecode. It is intentionally conservative:
+    output rows and cutoff semantics match radiusgraph.Graph.line_graph_adjacency_list.
+    """
+    cdef list line_graph = []
+    cdef object u_edge
+    cdef object directed_edges
+    cdef object directed_edge
+    cdef object center
+    cdef object de_index
+    cdef object edge_indices
+    cdef long n_directed
+    cdef long i
+    cdef double u_distance
+    cdef double directed_distance
+
+    assert len(undirected_edges_list) * 2 >= 0
+
+    for u_edge in undirected_edges_list:
+        u_distance = u_edge.info["distance"]
+        if u_distance > cutoff:
+            continue
+
+        edge_indices = u_edge.info["directed_edge_index"]
+        assert len(edge_indices) == 2, (
+            "Did not find 2 Directed_edges !!!"
+            f"undirected edge {u_edge} has:"
+            f"edge.info['directed_edge_index'] = "
+            f"{edge_indices}"
+        )
+
+        for i in range(2):
+            center = u_edge.nodes[i]
+            de_index = edge_indices[i]
+            for directed_edges in nodes[center].neighbors.values():
+                for directed_edge in directed_edges:
+                    if directed_edge.index == de_index:
+                        continue
+                    directed_distance = directed_edge.info["distance"]
+                    if directed_distance < cutoff:
+                        line_graph.append(
+                            [
+                                center,
+                                u_edge.index,
+                                de_index,
+                                directed_edge.info["undirected_edge_index"],
+                                directed_edge.index,
+                            ]
+                        )
+    return line_graph

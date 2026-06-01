@@ -1,0 +1,221 @@
+MatRIS sAlex Batch 推理 / 大 Batch 构图优化清单
+
+更新时间：2026-05-31
+
+本清单记录 MatRIS sAlex teacher `efsm` 路径上的 batch 调度、大 batch 推理和后续 NV batch 构图实验。它和 `MatRIS量化任务清单.txt` 分开维护：量化清单继续记录 P115 等单样本 endpoint 最佳主线；本清单只记录 batch 口径下的端到端效果、数值对齐和下一步构图优化。
+
+核心口径
+
+1. 最终性能仍只认端到端：
+   `test/eval/infer_salex_lmdb_quant.py --measure-time`
+2. 当前 batch 优化不是把单个晶体结构扩成更大的物理图，而是把多个独立结构拼成 batched disjoint graph。
+3. 样本之间不互相连边；每个结构保持独立，只是在一次 `model.forward` 里合并处理。
+4. 当前已完成的是：
+   `逐样本 graph_converter + process_graphs batched graph + batched model forward`
+5. 当前尚未完成的是：
+   `NV true batch neighbor_list / batch graph construction`
+
+当前结论
+
+当前最优 batch 结果：
+
+- 候选：P115 最佳 fuse 栈 + `batch_size=128` + `max_batch_atoms=2000`
+- limit500 端到端总耗时：`10.608796 s`
+- 吞吐：`47.130702 structures/s`
+- 成功样本：`500/500`
+- batch 数：`4`
+- 最大 batch 原子数：`1350`
+- 峰值显存：`54.456 GB`
+
+相对 P115 单样本历史最佳：
+
+- P115 batch=1 limit500：`36.741038 s`
+- P115 batch=128 limit500：`10.608796 s`
+- 端到端总耗时加速：约 `3.463x`
+
+优化原因判断
+
+sAlex 单样本通常很小，当前抽样 500 个样本合计约 `4948` 个原子，平均每个样本约 `9.896` 个原子。batch=1 时 GPU 看到的是大量小图，很多开销来自：
+
+```text
+Python / ASE / calculator 调度
+CUDA kernel launch
+GPU 同步
+小 GEMM
+小 scatter/gather
+force/stress autograd 的小算子链
+```
+
+将多个独立结构拼成 batched graph 后，模型内部许多 GEMM 和 kernel 的有效输入变大，launch 和调度开销被摊薄。因此 batch 优化显著提升的是整体吞吐，而不是改变单个样本的物理图含义。
+
+已实现改动
+
+文件：`test/eval/infer_salex_lmdb_quant.py`
+
+新增参数：
+
+```bash
+--max-batch-atoms
+```
+
+作用：
+
+- `--batch-size` 控制单个 batch 最多包含多少个结构。
+- `--max-batch-atoms` 控制单个 batch 最多包含多少个原子。
+- 当原子数即将超过阈值时提前切 batch，避免显存风险。
+- 默认值为 `0`，表示不启用原子数 cap；因此不影响原始 endpoint 口径。
+
+结果 JSON 里新增记录：
+
+```json
+"batch_stats": {
+  "num_batches": 4,
+  "max_structures_per_batch": 128,
+  "max_atoms_per_batch": 1350
+}
+```
+
+端到端结果汇总
+
+| 方式 | limit | 500 样本总耗时 | batch 数 | 最大 batch 原子数 | 吞吐 structures/s | 峰值显存 | 备注 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| FP32 baseline, batch=1 | 500 | `66.804174 s` | 500 | 单样本 | - | 未记录 | 历史清单结果 |
+| P115 最佳, batch=1 | 500 | `36.741038 s` | 500 | 单样本 | `13.608761` | 未记录 | 历史最佳单样本 |
+| 默认 FP32, batch=128 | 500 | `12.380947 s` | 4 | `1350` | `40.384634` | `29.498 GB` | 未开 P115 fuse |
+| 默认 FP32, batch=256 | 500 | `12.223784 s` | 2 | `2581` | `40.903866` | `58.515 GB` | 未开 P115 fuse |
+| 默认 FP32, batch=500, atom cap=3000 | 500 | `12.217019 s` | 2 | `2933` | `40.926514` | `66.982 GB` | 未开 P115 fuse |
+| P115 最佳, batch=128, atom cap=2000 | 500 | `10.608796 s` | 4 | `1350` | `47.130702` | `54.456 GB` | 当前 batch 最佳 |
+
+显存判断
+
+当前 A800 80GB 上的观察：
+
+- `batch_size=128, max_batch_atoms=2000`：峰值约 `54.456 GB`，推荐作为稳定 batch baseline。
+- `batch_size=256, max_batch_atoms=3000`：默认 FP32 已到 `58.515 GB`，收益很小。
+- `batch_size=500, max_batch_atoms=3000`：默认 FP32 已到 `66.982 GB`，收益几乎不变。
+- 不建议直接跑不带 atom cap 的 full `batch_size=500`，因为 500 样本总原子数约 `4948`，E/F/S force/stress autograd 路径可能逼近或超过 80GB。
+
+数值对齐
+
+limit500 aggregate 指标对比：
+
+| 指标 | P115 batch=128 | P115 batch=1 历史 | 相对差异 |
+| --- | ---: | ---: | ---: |
+| energy_mae_natoms | `0.007615025360` | `0.007654576930` | `-0.52%` |
+| force_mae | `0.021723859981` | `0.021735995319` | `-0.056%` |
+| stress_mae | `0.001429443843` | `0.001431522633` | `-0.145%` |
+
+逐样本对齐检查：
+
+- 配置：P115 最佳 fuse 栈
+- 样本：`limit=128`, `sample_seed=42`
+- 对比：`batch_size=1` vs `batch_size=128`
+- graph_id：完全一致
+
+逐样本最大差异：
+
+```text
+energy_pred max_abs_diff: 3.05e-05
+energy_pred mean_abs_diff: 1.14e-06
+energy_err  max_abs_diff: 3.30e-05
+force_mae   max_abs_diff: 1.19e-06
+stress_mae  max_abs_diff: 4.07e-07
+```
+
+结论：
+
+- P115 batch=128 和 P115 batch=1 数值基本对齐。
+- 没有明显精度偏移。
+- 差异符合浮点计算顺序和 batch reduction 顺序变化带来的小量误差。
+
+当前推荐复跑命令
+
+P115 batch=128 limit500：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+CUDA_HOME=/home/lht/miniconda3/envs/matris311 \
+PATH=/home/lht/miniconda3/envs/matris311/bin:$PATH \
+LD_LIBRARY_PATH=/home/lht/miniconda3/envs/matris311/lib:$LD_LIBRARY_PATH \
+MATRIS_P26_TAIL_INPUT_GRAD_ONLY=1 \
+MATRIS_P28_MLP_INPUT_GRAD_ONLY=1 \
+MATRIS_P29_MLP_BWD_KERNEL=1 \
+MATRIS_USE_CUDA_FUSED_LINE_ATTENTION=1 \
+MATRIS_USE_CUDA_FUSED_ATOM_ATTENTION=1 \
+MATRIS_USE_CUDA_DIRECTED2UNDIRECTED_AVERAGE=1 \
+MATRIS_P101_A3_LITE_ATTN_LINE_VJP=1 \
+MATRIS_P101_USE_NODE_INPUT_ATTENTION=0 \
+MATRIS_P105_A_CUDA1_ATTN_LINE_EDGE_ALPHA_BWD=1 \
+MATRIS_P106_A_CUDA2_ATTN_LINE_BWD_EDGE_DIRECT=1 \
+MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_OP_BWD=1 \
+MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_SCATTER_THRESHOLD=4096 \
+MATRIS_P113_GATED_TAIL_SECOND_SILU_MACRO=1 \
+MATRIS_P114_ATOM_EDGE_SECOND_TAIL=1 \
+MATRIS_P115_ALL_NODE_SECOND_TAIL=1 \
+/home/lht/miniconda3/envs/matris311/bin/python \
+test/eval/infer_salex_lmdb_quant.py \
+  --dataset-src /home/lht/lab/sAlex/val \
+  --model matris_10m_oam \
+  --task efsm \
+  --device cuda \
+  --precision-mode fp32 \
+  --quant-mode p71_latency_pruned_fusion_only \
+  --fusion-mode p28_p26_all_ffn_mlp_input_grad_only \
+  --limit 500 \
+  --sample-seed 42 \
+  --activation-calibration-limit 64 \
+  --batch-size 128 \
+  --max-batch-atoms 2000 \
+  --measure-time \
+  --output-json results/p115_batch128_limit500_20260531.json
+```
+
+下一步计划
+
+优先级 1：拆 batch 口径 stage profile
+
+- 在 `P115 + batch_size=128` 口径下拆分：
+  - graph_converter 总时间
+  - process_graphs 总时间
+  - model_forward 总时间
+  - result export 总时间
+- 目标：确认 batch 后构图占比是否明显上升。
+
+优先级 2：接 NV true batch 构图
+
+当前浅接 NV 只替换单样本 `structure.get_neighbor_list`，不推荐作为性能方向。真正要测试的是：
+
+```text
+多个 structure
+-> 拼 positions/cell/pbc/batch_idx/batch_ptr
+-> 一次 nvalchemiops.torch.neighbors.neighbor_list batch 调用
+-> 生成 MatRIS batched graph
+-> 直接进入 process_graphs / model forward
+```
+
+关键正确性要求：
+
+- 不允许跨样本连边。
+- atom edge set 与原 pymatgen 路径对齐。
+- line graph 数量和映射需要验证。
+- E/F/S 指标与 P115 batch=128 对齐。
+
+优先级 3：避免 CPU 往返
+
+如果 NV batch neighbor_list 本身有效，后续还需要减少 CPU 侧重组成本：
+
+- tensor/CUDA 生成 directed2undirected。
+- tensor/CUDA 生成 undirected2directed。
+- tensor/CUDA 或高效向量化生成 line_graph。
+- 最终目标是直接产出 MatRIS batched graph，减少 `Graph list -> process_graphs` 的 Python/CPU 开销。
+
+已有结果文件
+
+```text
+results/nv_batch128_limit500_20260531.json
+results/nv_batch256_limit500_20260531.json
+results/nv_batch500_cap3000_limit500_20260531.json
+results/p115_batch128_limit500_20260531.json
+results/p115_batch1_limit128_20260531.json
+results/p115_batch128_limit128_20260531.json
+```

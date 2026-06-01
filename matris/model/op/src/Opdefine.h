@@ -284,6 +284,27 @@ std::vector<torch::Tensor> fused_line_attention_backward(const torch::Tensor &gr
                                                          const torch::Tensor &source_index,
                                                          const torch::Tensor &target_index);
 
+std::vector<torch::Tensor> fused_line_attention_backward_with_edge_direct(
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &grad_edge_direct,
+    const torch::Tensor &values,
+    const torch::Tensor &source_out,
+    const torch::Tensor &target_out,
+    const torch::Tensor &source_alpha,
+    const torch::Tensor &target_alpha,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index);
+
+torch::Tensor fused_line_attention_values_backward_with_edge_direct(
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &grad_edge_direct,
+    const torch::Tensor &source_alpha,
+    const torch::Tensor &target_alpha,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index);
+
 torch::Tensor line_edge_gather_cat_forward(const torch::Tensor &node_feat,
                                            const torch::Tensor &edge_feat,
                                            const torch::Tensor &source_index,
@@ -313,6 +334,18 @@ std::vector<torch::Tensor> directed_edge_cat_grad_scatter_backward(const torch::
                                                                    int64_t node_rows,
                                                                    int64_t edge_rows);
 
+std::vector<torch::Tensor> directed_edge_silu_project_grad_scatter_backward_tile32(
+    const torch::Tensor &grad_core,
+    const torch::Tensor &grad_gate,
+    const torch::Tensor &core_projected,
+    const torch::Tensor &gate_projected,
+    const torch::Tensor &weight,
+    const torch::Tensor &edge_index,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index,
+    int64_t node_rows,
+    int64_t edge_rows);
+
 torch::Tensor refine_line_edge_gather_cat_forward(const torch::Tensor &node_feat,
                                                   const torch::Tensor &edge_feat,
                                                   const torch::Tensor &atom_feat,
@@ -336,6 +369,17 @@ std::vector<torch::Tensor> refine_line_project_grad_scatter_backward_tile32(
     const torch::Tensor &target_index,
     int64_t node_rows,
     int64_t edge_rows,
+    int64_t atom_rows);
+
+std::vector<torch::Tensor> refine_line_project_dual_grad_scatter_add_tile32(
+    const torch::Tensor &grad_core,
+    const torch::Tensor &grad_gate,
+    const torch::Tensor &weight,
+    const torch::Tensor &atom_index,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index,
+    const torch::Tensor &grad_node_in,
+    const torch::Tensor &grad_edge_in,
     int64_t atom_rows);
 
 std::vector<torch::Tensor> refine_line_first_silu_forward(
@@ -511,6 +555,17 @@ std::vector<torch::Tensor> refine_line_smooth_reduce_backward(const torch::Tenso
                                                               const torch::Tensor &source_index,
                                                               const torch::Tensor &target_index);
 
+torch::Tensor refine_line_smooth_reduce_sorted_forward(const torch::Tensor &nonlinear,
+                                                       const torch::Tensor &base_envelope,
+                                                       const torch::Tensor &source_index,
+                                                       const torch::Tensor &target_offsets);
+
+std::vector<torch::Tensor> refine_line_smooth_reduce_sorted_backward(const torch::Tensor &grad_out,
+                                                                     const torch::Tensor &nonlinear,
+                                                                     const torch::Tensor &base_envelope,
+                                                                     const torch::Tensor &source_index,
+                                                                     const torch::Tensor &target_offsets);
+
 std::vector<torch::Tensor> refine_line_edge_smooth_w8a8_backward_n128(
     const torch::Tensor &grad_refine_node,
     const torch::Tensor &grad_nonlinear_direct,
@@ -648,6 +703,68 @@ std::vector<torch::Tensor> line_edge_silu_project_alpha_grad_scatter_backward_ti
     const torch::Tensor &target_index,
     int64_t node_rows);
 
+std::vector<torch::Tensor> line_edge_silu_project_alpha_grad_scatter_backward_alpha_tile32(
+    const torch::Tensor &grad_core,
+    const torch::Tensor &grad_gate,
+    const torch::Tensor &core_projected,
+    const torch::Tensor &gate_projected,
+    const torch::Tensor &first_weight,
+    const torch::Tensor &grad_source_logits,
+    const torch::Tensor &grad_target_logits,
+    const torch::Tensor &source_alpha_weight,
+    const torch::Tensor &target_alpha_weight,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index,
+    int64_t node_rows);
+
+std::vector<torch::Tensor> line_edge_silu_project_alpha_grad_scatter_backward_dense_gemm(
+    const torch::Tensor &grad_core,
+    const torch::Tensor &grad_gate,
+    const torch::Tensor &core_projected,
+    const torch::Tensor &gate_projected,
+    const torch::Tensor &first_weight,
+    const torch::Tensor &grad_source_logits,
+    const torch::Tensor &grad_target_logits,
+    const torch::Tensor &source_alpha_weight,
+    const torch::Tensor &target_alpha_weight,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index,
+    int64_t node_rows);
+
+std::vector<torch::Tensor> line_edge_silu_project_alpha_grad_scatter_backward_target_reduce_tile32(
+    const torch::Tensor &grad_core,
+    const torch::Tensor &grad_gate,
+    const torch::Tensor &core_projected,
+    const torch::Tensor &gate_projected,
+    const torch::Tensor &first_weight,
+    const torch::Tensor &grad_source_logits,
+    const torch::Tensor &grad_target_logits,
+    const torch::Tensor &source_alpha_weight,
+    const torch::Tensor &target_alpha_weight,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index,
+    const torch::Tensor &target_offsets,
+    int64_t node_rows);
+
+std::vector<torch::Tensor> line_edge_silu_project_alpha_attention_grad_scatter_backward_tile32(
+    const torch::Tensor &grad_core,
+    const torch::Tensor &grad_gate,
+    const torch::Tensor &core_projected,
+    const torch::Tensor &gate_projected,
+    const torch::Tensor &first_weight,
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &values,
+    const torch::Tensor &source_out,
+    const torch::Tensor &target_out,
+    const torch::Tensor &source_alpha,
+    const torch::Tensor &target_alpha,
+    const torch::Tensor &source_alpha_weight,
+    const torch::Tensor &target_alpha_weight,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index,
+    int64_t node_rows);
+
 std::vector<torch::Tensor> line_edge_w8a8_tail_project_scatter_backward_n128(
     const torch::Tensor &grad_out,
     const torch::Tensor &core_pre,
@@ -685,6 +802,38 @@ std::vector<torch::Tensor> input_grad_only_gated_tail_backward_n128_v2(const tor
                                                                        const torch::Tensor &gate_weight,
                                                                        const torch::Tensor &gate_bias,
                                                                        double eps);
+
+std::vector<torch::Tensor> gated_tail_second_silu_input_grad_macro(
+    const torch::Tensor &grad_out,
+    const torch::Tensor &core,
+    const torch::Tensor &gate,
+    const torch::Tensor &core_weight,
+    const torch::Tensor &core_bias,
+    const torch::Tensor &gate_weight,
+    const torch::Tensor &gate_bias,
+    double eps,
+    const torch::Tensor &core_second_weight,
+    const torch::Tensor &gate_second_weight,
+    const torch::Tensor &core_first_hidden,
+    const torch::Tensor &gate_first_hidden,
+    bool use_tail_bwd_v2);
+
+std::vector<torch::Tensor> gated_tail_second_silu_residual_input_grad_macro(
+    const torch::Tensor &grad_out,
+    const torch::Tensor &core,
+    const torch::Tensor &gate,
+    const torch::Tensor &core_weight,
+    const torch::Tensor &core_bias,
+    const torch::Tensor &gate_weight,
+    const torch::Tensor &gate_bias,
+    double eps,
+    const torch::Tensor &core_second_weight,
+    const torch::Tensor &gate_second_weight,
+    const torch::Tensor &core_first_hidden,
+    const torch::Tensor &gate_first_hidden,
+    bool use_tail_bwd_v2,
+    const torch::Tensor &old_feat,
+    const torch::Tensor &res_weight);
 
 torch::Tensor input_grad_only_gated_tail_backward_stack(const torch::Tensor &grad_out,
                                                         const torch::Tensor &core,

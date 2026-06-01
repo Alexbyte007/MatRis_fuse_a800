@@ -19,6 +19,7 @@ def _use_p83_line_attention_offsets() -> bool:
         os.environ.get("MATRIS_P83_LINE_ATTENTION_OFFSETS", "0") == "1"
         or os.environ.get("MATRIS_P83B_LINE_ATTENTION_TARGET_OFFSETS", "0") == "1"
         or os.environ.get("MATRIS_P83C_LINE_ATTENTION_NODE_INPUT", "0") == "1"
+        or os.environ.get("MATRIS_P108_A_CUDA3_ATTN_LINE_TARGET_REDUCE_BWD", "0") == "1"
     )
 
 

@@ -26,15 +26,54 @@ from matris.model.processgraph import process_graphs  # noqa: E402
 
 
 DEFAULT_CANDIDATE_ENVS = {
+    "reference": {},
     "r1": {"MATRIS_P102_REFINE_LINE_R1_FFN_PAIR_VJP": "1"},
     "r2": {"MATRIS_P103_REFINE_LINE_R2_EDGE_UPDATE_EDGE_FFN_VJP": "1"},
     "r3": {"MATRIS_P104_REFINE_LINE_R3_BLOCK_VJP": "1"},
+    "r_cuda1_gather_project": {
+        "MATRIS_P58_REFINE_LINE_EDGE_UPDATE": "1",
+    },
+    "r_cuda1_project_scatter": {
+        "MATRIS_P58_REFINE_LINE_EDGE_UPDATE": "1",
+        "MATRIS_P58_REFINE_LINE_PROJECT_SCATTER_BWD": "1",
+    },
+    "r_cuda1_first_silu": {
+        "MATRIS_P58_REFINE_LINE_EDGE_UPDATE": "1",
+        "MATRIS_P60_REFINE_LINE_FUSED_FIRST": "1",
+    },
+    "r_cuda1_first_silu_project_scatter": {
+        "MATRIS_P58_REFINE_LINE_EDGE_UPDATE": "1",
+        "MATRIS_P60_REFINE_LINE_FUSED_FIRST": "1",
+        "MATRIS_P58_REFINE_LINE_PROJECT_SCATTER_BWD": "1",
+    },
+    "r_cuda2_smooth_reduce": {
+        "MATRIS_P58_REFINE_LINE_SMOOTH_REDUCE": "1",
+    },
+    "r_cuda2_smooth_reduce_sorted": {
+        "MATRIS_P58_REFINE_LINE_SMOOTH_REDUCE_SORTED": "1",
+    },
+    "r_cuda3_ffn_residual": {
+        "MATRIS_P109_REFINE_LINE_R_CUDA3_FFN_RESIDUAL": "1",
+    },
 }
 
 KNOWN_ENV_KEYS = (
     "MATRIS_P102_REFINE_LINE_R1_FFN_PAIR_VJP",
     "MATRIS_P103_REFINE_LINE_R2_EDGE_UPDATE_EDGE_FFN_VJP",
     "MATRIS_P104_REFINE_LINE_R3_BLOCK_VJP",
+    "MATRIS_P109_REFINE_LINE_R_CUDA3_FFN_RESIDUAL",
+    "MATRIS_P58_REFINE_LINE_SMOOTH_REDUCE",
+    "MATRIS_P58_REFINE_LINE_SMOOTH_REDUCE_SORTED",
+    "MATRIS_P58_REFINE_LINE_EDGE_UPDATE",
+    "MATRIS_P58_REFINE_LINE_PROJECT_SCATTER_BWD",
+    "MATRIS_P60_REFINE_LINE_FUSED_FIRST",
+    "MATRIS_P61_REFINE_LINE_FUSED_FIRST_ACTS",
+    "MATRIS_P61_REFINE_LINE_FIRST_TAIL",
+    "MATRIS_P63_REFINE_LINE_EDGE_SMOOTH_REDUCE",
+    "MATRIS_P64_REFINE_LINE_FUSED_BACKWARD",
+    "MATRIS_P65_REFINE_LINE_TILED_FUSED_BACKWARD",
+    "MATRIS_P65B_REFINE_LINE_PACKED_TILED_BWD",
+    "MATRIS_P69_REFINE_LINE_FIRST_TAIL_SMOOTH_REDUCE",
 )
 
 PURE_FUSE_ENV = {
@@ -44,6 +83,16 @@ PURE_FUSE_ENV = {
     "MATRIS_USE_CUDA_FUSED_LINE_ATTENTION": "1",
     "MATRIS_USE_CUDA_FUSED_ATOM_ATTENTION": "1",
     "MATRIS_USE_CUDA_DIRECTED2UNDIRECTED_AVERAGE": "1",
+}
+
+P108_BEST_ENV = {
+    "MATRIS_P83B_LINE_ATTENTION_TARGET_OFFSETS": "1",
+    "MATRIS_P101_A3_LITE_ATTN_LINE_VJP": "1",
+    "MATRIS_P101_USE_NODE_INPUT_ATTENTION": "0",
+    "MATRIS_P105_A_CUDA1_ATTN_LINE_EDGE_ALPHA_BWD": "1",
+    "MATRIS_P106_A_CUDA2_ATTN_LINE_BWD_EDGE_DIRECT": "1",
+    "MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_OP_BWD": "1",
+    "MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_SCATTER_THRESHOLD": "4096",
 }
 
 
@@ -68,7 +117,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=2.0e-5)
     parser.add_argument("--rtol", type=float, default=2.0e-5)
     parser.add_argument("--output-json", default="results/refine_line_macro_correctness/r1_block0.json")
+    parser.add_argument("--output-md", default="results/refine_line_macro_correctness/r1_block0.md")
     parser.add_argument("--no-set-pure-fuse-env", action="store_true")
+    parser.add_argument(
+        "--no-set-p108-best-env",
+        action="store_true",
+        help="Do not set the current P108 attn_line best env before checking refine_line.",
+    )
     return parser.parse_args()
 
 
@@ -109,6 +164,8 @@ def tensor_diff(a: torch.Tensor, b: torch.Tensor, *, atol: float, rtol: float) -
         "max_abs": float(diff.max().item()) if diff.numel() else 0.0,
         "mean_abs": float(diff.mean().item()) if diff.numel() else 0.0,
         "max_rel": float(rel.max().item()) if rel.numel() else 0.0,
+        "mean_rel": float(rel.mean().item()) if rel.numel() else 0.0,
+        "ref_abs_mean": float(a.detach().float().abs().mean().item()) if a.numel() else 0.0,
         "allclose": bool(torch.allclose(a, b, atol=atol, rtol=rtol)),
     }
 
@@ -223,9 +280,11 @@ def main() -> None:
     args = parse_args()
     if not args.no_set_pure_fuse_env:
         for key, value in PURE_FUSE_ENV.items():
-            os.environ.setdefault(key, value)
+            os.environ[key] = value
         os.environ.pop("MATRIS_W8A8_BACKEND", None)
         os.environ.pop("MATRIS_W8A8_DISABLE_FAST_WRAPPER", None)
+    if not args.no_set_p108_best_env:
+        os.environ.update(P108_BEST_ENV)
 
     configure_precision(args.device, args.precision_mode)
     calculator = build_calculator(args)
@@ -271,7 +330,27 @@ def main() -> None:
     }
     output = Path(args.output_json)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    output.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    output_md = Path(args.output_md)
+    output_md.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# refine_line Macro Correctness",
+        "",
+        f"- candidate: `{summary['candidate']}`",
+        f"- block_index: `{summary['block_index']}`",
+        f"- checked/skipped: `{summary['checked']}/{summary['skipped']}`",
+        f"- passed/failed: `{summary['passed']}/{summary['failed']}`",
+        f"- P108 best env: `{not args.no_set_p108_best_env}`",
+        "",
+        "| tensor | max_abs | max_mean_abs | max_rel |",
+        "|---|---:|---:|---:|",
+    ]
+    for name, item in summary["worst"].items():
+        lines.append(
+            f"| `{name}` | `{item['max_abs']:.12g}` | `{item['mean_abs']:.12g}` | `{item['max_rel']:.12g}` |"
+        )
+    lines.extend(["", "Result: `" + ("PASS" if summary["all_passed"] else "FAIL") + "`", ""])
+    output_md.write_text("\n".join(lines), encoding="utf-8")
     print(json.dumps({k: v for k, v in summary.items() if k != "results"}, indent=2))
 
 

@@ -384,6 +384,68 @@ __global__ void fused_line_attention_backward_kernel(
   grad_values[idx] = sa * gs + ta * gt;
 }
 
+__global__ void fused_line_attention_backward_with_edge_direct_kernel(
+    const float* __restrict__ grad_source_out,
+    const float* __restrict__ grad_target_out,
+    const float* __restrict__ grad_edge_direct,
+    const float* __restrict__ values,
+    const float* __restrict__ source_out,
+    const float* __restrict__ target_out,
+    const float* __restrict__ source_alpha,
+    const float* __restrict__ target_alpha,
+    const int64_t* __restrict__ source_index,
+    const int64_t* __restrict__ target_index,
+    float* __restrict__ grad_source_logits,
+    float* __restrict__ grad_target_logits,
+    float* __restrict__ grad_values,
+    int64_t rows) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = rows * kDim;
+  if (idx >= total) {
+    return;
+  }
+  int64_t row = idx / kDim;
+  int dim = idx - row * kDim;
+  int64_t s = source_index[row];
+  int64_t t = target_index[row];
+  float v = values[idx];
+  float sa = source_alpha[idx];
+  float ta = target_alpha[idx];
+  float gs = grad_source_out[s * kDim + dim];
+  float gt = grad_target_out[t * kDim + dim];
+  float os = source_out[s * kDim + dim];
+  float ot = target_out[t * kDim + dim];
+  grad_source_logits[idx] = sa * gs * (v - os);
+  grad_target_logits[idx] = ta * gt * (v - ot);
+  grad_values[idx] = sa * gs + ta * gt + grad_edge_direct[idx];
+}
+
+__global__ void fused_line_attention_values_backward_with_edge_direct_kernel(
+    const float* __restrict__ grad_source_out,
+    const float* __restrict__ grad_target_out,
+    const float* __restrict__ grad_edge_direct,
+    const float* __restrict__ source_alpha,
+    const float* __restrict__ target_alpha,
+    const int64_t* __restrict__ source_index,
+    const int64_t* __restrict__ target_index,
+    float* __restrict__ grad_values,
+    int64_t rows) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = rows * kDim;
+  if (idx >= total) {
+    return;
+  }
+  int64_t row = idx / kDim;
+  int dim = idx - row * kDim;
+  int64_t s = source_index[row];
+  int64_t t = target_index[row];
+  float sa = source_alpha[idx];
+  float ta = target_alpha[idx];
+  float gs = grad_source_out[s * kDim + dim];
+  float gt = grad_target_out[t * kDim + dim];
+  grad_values[idx] = sa * gs + ta * gt + grad_edge_direct[idx];
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> fused_line_attention_forward(const torch::Tensor &source_logits,
@@ -928,4 +990,110 @@ std::vector<torch::Tensor> fused_line_attention_backward(const torch::Tensor &gr
       rows);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {grad_source_logits, grad_target_logits, grad_values};
+}
+
+std::vector<torch::Tensor> fused_line_attention_backward_with_edge_direct(
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &grad_edge_direct,
+    const torch::Tensor &values,
+    const torch::Tensor &source_out,
+    const torch::Tensor &target_out,
+    const torch::Tensor &source_alpha,
+    const torch::Tensor &target_alpha,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index) {
+  TORCH_CHECK(grad_source_out.is_cuda() && grad_target_out.is_cuda() && grad_edge_direct.is_cuda() &&
+                  values.is_cuda() && source_out.is_cuda() && target_out.is_cuda() &&
+                  source_alpha.is_cuda() && target_alpha.is_cuda() && source_index.is_cuda() &&
+                  target_index.is_cuda(),
+              "fused_line_attention_backward_with_edge_direct: tensors must be CUDA");
+  TORCH_CHECK(values.scalar_type() == torch::kFloat32 && grad_source_out.scalar_type() == torch::kFloat32 &&
+                  grad_target_out.scalar_type() == torch::kFloat32 &&
+                  grad_edge_direct.scalar_type() == torch::kFloat32,
+              "fused_line_attention_backward_with_edge_direct: float tensors must be float32");
+  TORCH_CHECK(values.sizes() == grad_edge_direct.sizes(),
+              "fused_line_attention_backward_with_edge_direct: values/grad_edge_direct shape mismatch");
+  auto grad_source_logits = torch::empty_like(values);
+  auto grad_target_logits = torch::empty_like(values);
+  auto grad_values = torch::empty_like(values);
+  auto grad_source_out_c = grad_source_out.contiguous();
+  auto grad_target_out_c = grad_target_out.contiguous();
+  auto grad_edge_direct_c = grad_edge_direct.contiguous();
+  auto values_c = values.contiguous();
+  auto source_out_c = source_out.contiguous();
+  auto target_out_c = target_out.contiguous();
+  auto source_alpha_c = source_alpha.contiguous();
+  auto target_alpha_c = target_alpha.contiguous();
+  auto source_index_c = source_index.contiguous();
+  auto target_index_c = target_index.contiguous();
+  int64_t rows = values_c.size(0);
+  int blocks = static_cast<int>((rows * kDim + kThreads - 1) / kThreads);
+  fused_line_attention_backward_with_edge_direct_kernel<<<blocks, kThreads>>>(
+      grad_source_out_c.data_ptr<float>(),
+      grad_target_out_c.data_ptr<float>(),
+      grad_edge_direct_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      source_out_c.data_ptr<float>(),
+      target_out_c.data_ptr<float>(),
+      source_alpha_c.data_ptr<float>(),
+      target_alpha_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      target_index_c.data_ptr<int64_t>(),
+      grad_source_logits.data_ptr<float>(),
+      grad_target_logits.data_ptr<float>(),
+      grad_values.data_ptr<float>(),
+      rows);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {grad_source_logits, grad_target_logits, grad_values};
+}
+
+torch::Tensor fused_line_attention_values_backward_with_edge_direct(
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &grad_edge_direct,
+    const torch::Tensor &source_alpha,
+    const torch::Tensor &target_alpha,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_index) {
+  TORCH_CHECK(grad_source_out.is_cuda() && grad_target_out.is_cuda() && grad_edge_direct.is_cuda() &&
+                  source_alpha.is_cuda() && target_alpha.is_cuda() && source_index.is_cuda() &&
+                  target_index.is_cuda(),
+              "fused_line_attention_values_backward_with_edge_direct: tensors must be CUDA");
+  TORCH_CHECK(grad_source_out.scalar_type() == torch::kFloat32 &&
+                  grad_target_out.scalar_type() == torch::kFloat32 &&
+                  grad_edge_direct.scalar_type() == torch::kFloat32 &&
+                  source_alpha.scalar_type() == torch::kFloat32 &&
+                  target_alpha.scalar_type() == torch::kFloat32,
+              "fused_line_attention_values_backward_with_edge_direct: float tensors must be float32");
+  TORCH_CHECK(source_index.scalar_type() == torch::kInt64 && target_index.scalar_type() == torch::kInt64,
+              "fused_line_attention_values_backward_with_edge_direct: indices must be int64");
+  TORCH_CHECK(grad_edge_direct.sizes() == source_alpha.sizes() &&
+                  grad_edge_direct.sizes() == target_alpha.sizes(),
+              "fused_line_attention_values_backward_with_edge_direct: edge tensor shape mismatch");
+  auto grad_source_out_c = grad_source_out.contiguous();
+  auto grad_target_out_c = grad_target_out.contiguous();
+  auto grad_edge_direct_c = grad_edge_direct.contiguous();
+  auto source_alpha_c = source_alpha.contiguous();
+  auto target_alpha_c = target_alpha.contiguous();
+  auto source_index_c = source_index.contiguous();
+  auto target_index_c = target_index.contiguous();
+  auto grad_values = torch::empty_like(grad_edge_direct_c);
+  int64_t rows = grad_edge_direct_c.size(0);
+  if (rows == 0) {
+    return grad_values;
+  }
+  int blocks = static_cast<int>((rows * kDim + kThreads - 1) / kThreads);
+  fused_line_attention_values_backward_with_edge_direct_kernel<<<blocks, kThreads>>>(
+      grad_source_out_c.data_ptr<float>(),
+      grad_target_out_c.data_ptr<float>(),
+      grad_edge_direct_c.data_ptr<float>(),
+      source_alpha_c.data_ptr<float>(),
+      target_alpha_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      target_index_c.data_ptr<int64_t>(),
+      grad_values.data_ptr<float>(),
+      rows);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return grad_values;
 }
