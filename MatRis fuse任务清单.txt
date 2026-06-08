@@ -1,6 +1,6 @@
 MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 
-更新时间：2026-06-02
+更新时间：2026-06-08
 
 本清单只维护 MatRIS sAlex teacher `efsm` 路径的有效优化主线。旧量化路线、失败分支和重复过程日志已精简；详细原始记录可查 `MatRIS_compile任务清单.txt` 和 `results/`。
 
@@ -15,11 +15,11 @@ MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 
 当前最佳候选
 
-当前最佳：P115 all node + atom edge GatedMLP second-tail CUDA macro + line graph GC guard + atom attention P35/P120。
+当前最佳：P115 all node + atom edge GatedMLP second-tail CUDA macro + line graph GC guard + atom attention P35/P120 + P123 GatedMLP forward tail fused CUDA op。
 
 核心结论：
 
-- limit500：`69.101997 ms`
+- limit500：`65.885158 ms`
 - limit5000：`69.341815 ms`
 - limit5000 当前最佳总时间：`346.639731 s`
 - 相对最初 FP32 baseline 5000 总时间：`1.894104x`
@@ -40,6 +40,7 @@ MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 + 构图 line_graph 阶段临时禁用 Python GC，降低 CPU 长尾
 + atom edge gather/index_select+cat + first projection dataflow
 + atom attention target-offset forward，减少 target reduce/zero/max glue
++ P123 GatedMLP forward tail fused CUDA op，合并两路 LayerNorm + SiLU/Sigmoid + core*gate
 ```
 
 P115 的关键优化点
@@ -71,6 +72,7 @@ P115 + line graph GC guard + atom attention P35/P120 端到端结果
 | 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | energy_mae_natoms | force_mae | stress_mae | 成功样本 | 结论 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
 | P115 + GC guard + P35/P120 atom attention | 500 | `69.101997` | `34.550998` | `14.471362` | `0.007654570565` | `0.021735963863` | `0.001431521616` | `500/500` | 当前 500 最佳 |
+| P115 + GC guard + P35/P120 atom attention + P123 GatedMLP forward tail | 500 | `65.885158` | `32.942579` | `15.177922` | `0.007654583193` | `0.021736022550` | `0.001431524982` | `500/500` | 当前 500 新最佳 |
 | P115 + GC guard + P35/P120 atom attention | 5000 | `69.341815` | `346.639731` | `14.421313` | `0.009076239999` | `0.025285691717` | `0.001527280735` | `4999/5000` | 当前 5000 最佳；总时间相对最初 FP32 baseline `1.894104x` |
 
 旧 P115/GC guard 结果：
@@ -150,6 +152,7 @@ P115 当前保留/清理状态（2026-06-02）
 | P115 all node + atom edge second-tail | 5000 | `73.422104` | `367.037097` | `13.619877` | `4999/5000` | 旧最佳 |
 | P115 + line_graph GC guard | 5000 | `70.577460` | `352.816722` | `14.168830` | `4999/5000` | P35/P120 前最佳 |
 | P115 + GC guard + P35/P120 atom attention | 5000 | `69.341815` | `346.639731` | `14.421313` | `4999/5000` | 当前最佳，总时间加速 `1.894104x` |
+| P115 + GC guard + P35/P120 atom attention + P123 GatedMLP forward tail | 500 | `65.885158` | `32.942579` | `15.177922` | `500/500` | 当前 500 新最佳 |
 
 当前最佳复跑命令
 
@@ -161,6 +164,7 @@ CUDA_HOME=/home/lht/miniconda3/envs/matris311 \
 PATH=/home/lht/miniconda3/envs/matris311/bin:$PATH \
 LD_LIBRARY_PATH=/home/lht/miniconda3/envs/matris311/lib:$LD_LIBRARY_PATH \
 MATRIS_DISABLE_GC_DURING_LINE_GRAPH=1 \
+MATRIS_P123_GATED_TAIL_FORWARD_FUSED=1 \
 MATRIS_USE_FAST_LINE_GRAPH=0 \
 MATRIS_P26_TAIL_INPUT_GRAD_ONLY=1 \
 MATRIS_P28_MLP_INPUT_GRAD_ONLY=1 \
@@ -402,3 +406,69 @@ node_update backward 还有空间，但不能简单再包一层
 
 copy/index_add/cat 是真实残余，但要并进大边界
 单独写一个 copy 或 final_add kernel 不值得；它们应该并进 edge_alpha_project_scatter 或 node_update macro。
+
+
+1. attn_line / P101 周围最明显
+
+带归因的 4 样本 trace 里，已归因 glue 总计约 30.65 ms，其中 attn_line 占 10.47 ms，是最集中的模块。
+
+主要落在：
+
+P101.a3_lite_attn_line.forward
+
+elementwise：4.925 ms
+reduce：1.427 ms
+copy/contiguous：0.430 ms
+scatter/gather：0.141 ms
+P101.a3_lite_attn_line.backward
+
+elementwise：1.753 ms
+copy/contiguous：1.437 ms
+reduce：0.116 ms
+cat：0.114 ms
+这说明 line attention 虽然已经有 fused attention / fused backward / edge-alpha scatter 路径，但 P101 这个 custom VJP 外围还有 PyTorch glue：残差 add、grad 累加、临时 tensor copy、部分 reduce/cat。
+
+2. GatedMLP forward tail 还没真正 fuse
+
+P113/P115 主要吃的是 backward second-tail，但 forward 侧仍能看到：
+
+LayerNorm kernel
+SiLU kernel
+Sigmoid kernel
+core * gate 的 mul
+一些 copy/layout
+这些在每个模块里都不大，但重复次数多。
+
+归因里：
+
+attn_atom：约 2.36 ms
+refine_line：约 1.55 ms
+refine_atom：约 1.25 ms
+典型 range 是：
+
+P113.gated_tail_second.interaction_block.*.refine_block_line_graph.edge_nonlinear_update.forward
+
+每个 block 里大约还有 LayerNorm + SiLU/Sigmoid + mul 这类小 kernel。
+
+3. 还有一批未归因的 Torch scatter/index/cat
+
+从 trace 全局看，比较显眼的是：
+
+torch_scatter_gather：2.286 ms
+indexFuncLargeIndex / ReduceAdd：1.952 ms
+CatArrayBatchedCopy：0.969 ms
+vectorized_gather_kernel：0.204 ms
+这些没有完全落进当前 record range，说明它们可能在 interaction block 外围、force autograd 汇总、embedding/readout 或某些没有打 range 的 PyTorch autograd 边界里。
+
+结论
+
+现在最值得继续看的 glue 是：
+
+attn_line P101.a3_lite_attn_line.forward/backward 外围 glue
+这是当前最集中的残留边界。
+
+GatedMLP forward tail
+backward 已经吃掉不少，但 forward 的 LayerNorm + activation + multiply 仍然是 PyTorch 小 kernel。
+
+未归因的 indexFuncLargeIndex / scatter_gather / CatArrayBatchedCopy
+下一步需要给 force autograd、embedding/readout、interaction block 外层再加 NVTX range，才能定位它们具体来自哪段。

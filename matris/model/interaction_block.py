@@ -217,6 +217,10 @@ def _p108_attn_line_dense_gemm_scatter_threshold() -> int:
     return int(os.environ.get("MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_SCATTER_THRESHOLD", "4096"))
 
 
+def _p123_use_gated_tail_forward_fused() -> bool:
+    return os.environ.get("MATRIS_P123_GATED_TAIL_FORWARD_FUSED", "0") == "1"
+
+
 def _use_p58_refine_line_smooth_reduce(profile_prefix: str) -> bool:
     if os.environ.get("MATRIS_P58_REFINE_LINE_SMOOTH_REDUCE", "0") != "1":
         return False
@@ -533,14 +537,64 @@ def _p53b_tail_forward(
     core_norm: nn.Module | None,
     gate_norm: nn.Module | None,
 ) -> tuple[Tensor, dict[str, Any]]:
-    core_ln, core_ln_cache = _p53b_layernorm_forward(core, core_norm)
-    gate_ln, gate_ln_cache = _p53b_layernorm_forward(gate, gate_norm)
-    core_act = F.silu(core_ln)
-    gate_act = torch.sigmoid(gate_ln)
     core_weight = core_norm.weight.float() if isinstance(core_norm, nn.LayerNorm) else None
     core_bias = core_norm.bias.float() if isinstance(core_norm, nn.LayerNorm) else None
     gate_weight = gate_norm.weight.float() if isinstance(gate_norm, nn.LayerNorm) else None
     gate_bias = gate_norm.bias.float() if isinstance(gate_norm, nn.LayerNorm) else None
+    eps = float(core_norm.eps) if isinstance(core_norm, nn.LayerNorm) else 1.0e-5
+    matris_op = _load_matris_op()
+    if (
+        _p123_use_gated_tail_forward_fused()
+        and matris_op is not None
+        and hasattr(matris_op, "fp32_gated_tail_forward_n128")
+        and isinstance(core_weight, Tensor)
+        and isinstance(core_bias, Tensor)
+        and isinstance(gate_weight, Tensor)
+        and isinstance(gate_bias, Tensor)
+        and core.is_cuda
+        and gate.is_cuda
+        and core_weight.is_cuda
+        and core_bias.is_cuda
+        and gate_weight.is_cuda
+        and gate_bias.is_cuda
+        and core.dtype == torch.float32
+        and gate.dtype == torch.float32
+        and core_weight.dtype == torch.float32
+        and core_bias.dtype == torch.float32
+        and gate_weight.dtype == torch.float32
+        and gate_bias.dtype == torch.float32
+        and core.ndim == 2
+        and core.shape == gate.shape
+        and core.shape[-1] in (128, 256)
+    ):
+        out = matris_op.fp32_gated_tail_forward_n128(
+            core,
+            gate,
+            core_weight.contiguous(),
+            core_bias.contiguous(),
+            gate_weight.contiguous(),
+            gate_bias.contiguous(),
+            eps,
+        )
+        return out, {
+            "core": core,
+            "gate": gate,
+            "core_ln": None,
+            "gate_ln": None,
+            "gate_act": None,
+            "core_ln_cache": None,
+            "gate_ln_cache": None,
+            "core_weight": core_weight,
+            "core_bias": core_bias,
+            "gate_weight": gate_weight,
+            "gate_bias": gate_bias,
+            "eps": eps,
+            "fused_forward": True,
+        }
+    core_ln, core_ln_cache = _p53b_layernorm_forward(core, core_norm)
+    gate_ln, gate_ln_cache = _p53b_layernorm_forward(gate, gate_norm)
+    core_act = F.silu(core_ln)
+    gate_act = torch.sigmoid(gate_ln)
     return core_act * gate_act, {
         "core": core,
         "gate": gate,
@@ -553,7 +607,8 @@ def _p53b_tail_forward(
         "core_bias": core_bias,
         "gate_weight": gate_weight,
         "gate_bias": gate_bias,
-        "eps": float(core_norm.eps) if isinstance(core_norm, nn.LayerNorm) else 1.0e-5,
+        "eps": eps,
+        "fused_forward": False,
     }
 
 
